@@ -324,10 +324,67 @@ def test_decode_output_handles_non_utf8_console_bytes() -> None:
 
 
 def test_limit_cache_roundtrip() -> None:
-    original = LimitUsage(weekly_percent=42.0, session_percent=5.0, ok=True, checked_at=1.0)
+    original = LimitUsage(
+        weekly_percent=42.0,
+        session_percent=5.0,
+        session_resets="Sep 13, 10:20pm",
+        weekly_resets="Sep 19, 12pm",
+        ok=True,
+        checked_at=1.0,
+    )
     restored = LimitUsage.from_dict(original.to_dict())
     assert restored.weekly_percent == 42.0
+    assert restored.session_resets == "Sep 13, 10:20pm"
+    assert restored.weekly_resets == "Sep 19, 12pm"
     assert restored.from_cache is True
+
+
+def test_headline_tracks_whichever_limit_is_closest_to_biting() -> None:
+    assert LimitUsage(session_percent=80.0, weekly_percent=24.0).headline_percent == 80.0
+    assert LimitUsage(session_percent=10.0, weekly_percent=24.0).headline_percent == 24.0
+    assert LimitUsage(session_percent=10.0).headline_percent == 10.0
+    assert LimitUsage().headline_percent is None
+
+
+@pytest.mark.parametrize(
+    "stamp, expected",
+    [
+        ("Sep 19, 12pm (America/New_York)", "5d 18h"),
+        ("Sep 13, 10:20pm (America/New_York)", "4h 25m"),
+        ("Sep 13, 10:20pm", "4h 25m"),
+        ("10:20pm", "4h 25m"),
+        ("Sep 13, 6:00pm", "5m"),
+        ("Sep 13, 5:55pm", "now"),
+        ("Jan 2, 9am", "110d 15h"),
+    ],
+)
+def test_format_countdown(stamp: str, expected: str) -> None:
+    from datetime import datetime
+
+    from parser import format_countdown
+
+    assert format_countdown(stamp, datetime(2026, 9, 13, 17, 55)) == expected
+
+
+def test_countdown_degrades_to_the_raw_text() -> None:
+    """An upstream format change must still show something useful."""
+    from datetime import datetime
+
+    from parser import format_countdown, parse_reset_stamp
+
+    now = datetime(2026, 9, 13, 17, 55)
+    assert parse_reset_stamp("next tuesday-ish", now) is None
+    assert format_countdown("next tuesday-ish", now) == "next tuesday"
+    assert format_countdown("", now) == ""
+
+
+def test_reset_stamp_rolls_over_the_year() -> None:
+    from datetime import datetime
+
+    from parser import parse_reset_stamp
+
+    target = parse_reset_stamp("Jan 2, 9am", datetime(2026, 12, 28, 10, 0))
+    assert target is not None and target.year == 2027
 
 
 def test_limit_cache_rejects_garbage() -> None:
@@ -353,7 +410,7 @@ def test_format_tokens_is_compact() -> None:
 def test_config_merge_ignores_unknown_and_keeps_defaults() -> None:
     cfg = Config.from_dict({"window": {"width": 300, "bogus": 1}, "nope": {"x": 1}})
     assert cfg.window.width == 300
-    assert cfg.window.height == 65
+    assert cfg.window.height == Config().window.height
 
 
 def test_theme_thresholds() -> None:

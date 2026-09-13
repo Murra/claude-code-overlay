@@ -29,6 +29,7 @@ import re
 import subprocess
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -120,7 +121,10 @@ class LimitUsage:
     session_percent: Optional[float] = None
     weekly_percent: Optional[float] = None
     opus_percent: Optional[float] = None
-    resets_at: str = ""
+
+    #: Reset stamps exactly as printed, e.g. "Sep 19, 12pm (America/New_York)".
+    session_resets: str = ""
+    weekly_resets: str = ""
 
     ok: bool = False
     status: str = "--"
@@ -132,7 +136,8 @@ class LimitUsage:
             "session_percent": self.session_percent,
             "weekly_percent": self.weekly_percent,
             "opus_percent": self.opus_percent,
-            "resets_at": self.resets_at,
+            "session_resets": self.session_resets,
+            "weekly_resets": self.weekly_resets,
             "checked_at": self.checked_at,
         }
 
@@ -146,7 +151,8 @@ class LimitUsage:
             session_percent=_pct("session_percent"),
             weekly_percent=_pct("weekly_percent"),
             opus_percent=_pct("opus_percent"),
-            resets_at=str(raw.get("resets_at") or ""),
+            session_resets=str(raw.get("session_resets") or ""),
+            weekly_resets=str(raw.get("weekly_resets") or ""),
             checked_at=float(raw.get("checked_at") or 0.0),
             ok=True,
             status="cached",
@@ -155,10 +161,151 @@ class LimitUsage:
 
     @property
     def headline_percent(self) -> Optional[float]:
-        """The number worth putting on a 220x65 overlay: weekly, else session."""
-        if self.weekly_percent is not None:
-            return self.weekly_percent
-        return self.session_percent
+        """Whichever limit is closest to biting."""
+        values = [v for v in (self.weekly_percent, self.session_percent) if v is not None]
+        return max(values) if values else None
+
+    @property
+    def resets_at(self) -> str:
+        """Reset stamp belonging to the headline figure."""
+        if self.weekly_percent is not None and self.weekly_resets:
+            if self.session_percent is None or self.weekly_percent >= self.session_percent:
+                return self.weekly_resets
+        return self.session_resets or self.weekly_resets
+
+    def session_countdown(self, now: Optional[datetime] = None) -> str:
+        return format_countdown(self.session_resets, now)
+
+    def weekly_countdown(self, now: Optional[datetime] = None) -> str:
+        return format_countdown(self.weekly_resets, now)
+
+
+
+#: ``Sep 19, 12pm (America/New_York)`` / ``Sep 13, 10:20pm`` / ``10:20pm``.
+_STAMP_RE = re.compile(
+    r"^(?:(?P<month>[A-Za-z]{3,9})\s+(?P<day>\d{1,2})\s*,?\s*)?"
+    r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<meridiem>am|pm)?"
+    r"(?:\s*\((?P<tz>[^)]+)\))?\s*$",
+    re.IGNORECASE,
+)
+
+_MONTHS = {
+    name.lower(): index
+    for index, name in enumerate(
+        ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+        start=1,
+    )
+}
+
+
+def _zone(name: Optional[str]):
+    """Resolve an IANA zone name, or ``None`` to mean "treat as local time".
+
+    Windows ships no tz database, so ``ZoneInfo("America/New_York")`` raises
+    unless the ``tzdata`` package happens to be installed. That is not worth a
+    hard dependency: the CLI prints the stamp in the user's own local zone, so
+    falling back to naive local time gives the same answer on the machine that
+    matters.
+    """
+    if not name:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo(name.strip())
+    except Exception:
+        return None
+
+
+def parse_reset_stamp(text: str, now: Optional[datetime] = None) -> Optional[datetime]:
+    """Turn a printed reset stamp into a datetime in the local zone.
+
+    The stamp carries no year, so the nearest sensible future date is chosen:
+    a month/day that has already passed rolls into next year, and a bare
+    time-of-day that has passed rolls to tomorrow.
+    """
+    if not text:
+        return None
+    match = _STAMP_RE.match(text.strip())
+    if not match:
+        return None
+
+    now = now or datetime.now()
+    parts = match.groupdict()
+
+    try:
+        hour = int(parts["hour"])
+        minute = int(parts["minute"] or 0)
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+
+    meridiem = (parts["meridiem"] or "").lower()
+    if meridiem == "pm" and hour != 12:
+        hour += 12
+    elif meridiem == "am" and hour == 12:
+        hour = 0
+    if hour > 23:
+        return None
+
+    zone = _zone(parts["tz"])
+    reference = now.astimezone(zone) if zone else now
+
+    month_name = parts["month"]
+    if month_name:
+        month = _MONTHS.get(month_name[:3].lower())
+        if not month:
+            return None
+        try:
+            day = int(parts["day"])
+            target = reference.replace(
+                month=month, day=day, hour=hour, minute=minute,
+                second=0, microsecond=0,
+            )
+        except ValueError:
+            return None
+        if (target - reference) < timedelta(days=-180):
+            try:
+                target = target.replace(year=target.year + 1)
+            except ValueError:
+                return None
+    else:
+        target = reference.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= reference:
+            target += timedelta(days=1)
+
+    if zone is not None:
+        target = target.astimezone()
+        return target.replace(tzinfo=None)
+    return target
+
+
+def format_countdown(text: str, now: Optional[datetime] = None) -> str:
+    """Time remaining until a reset stamp, as ``5d 6h`` / ``2h 14m`` / ``45m``.
+
+    Falls back to a shortened form of the original text when the stamp cannot
+    be parsed, so an upstream format change degrades to something still useful
+    rather than to nothing.
+    """
+    target = parse_reset_stamp(text, now)
+    if target is None:
+        return text.split("(")[0].strip()[:12]
+
+    remaining = target - (now or datetime.now())
+    seconds = int(remaining.total_seconds())
+    if seconds <= 0:
+        return "now"
+
+    days, seconds = divmod(seconds, 86_400)
+    hours, seconds = divmod(seconds, 3_600)
+    minutes = seconds // 60
+    if days:
+        return f"{days}d {hours}h" if hours else f"{days}d"
+    if hours:
+        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    return f"{minutes}m" if minutes else "<1m"
 
 
 # --------------------------------------------------------------------------- #
@@ -582,9 +729,8 @@ def parse_limit_output(text: str) -> LimitUsage:
             result.session_percent = percent
             session_reset = session_reset or reset
 
-    # The badge shows the weekly figure when there is one, so pair it with the
-    # matching reset time rather than whichever line happened to come first.
-    result.resets_at = weekly_reset or session_reset
+    result.session_resets = session_reset
+    result.weekly_resets = weekly_reset
 
     if (
         result.weekly_percent is None
@@ -880,7 +1026,25 @@ def format_percent(percent: Optional[float]) -> str:
 
 def build_tooltip(usage: SessionUsage, limits: LimitUsage, cfg: Config) -> str:
     """Rich HTML tooltip with every number we have."""
-    rows: List[Tuple[str, str]] = [
+    rows: List[Tuple[str, str]] = []
+    if limits.session_percent is not None:
+        rows.append(
+            ("Session", f"{format_percent(limits.session_percent)}"
+                        f"  ·  resets {limits.session_resets or '?'}")
+        )
+    if limits.weekly_percent is not None:
+        rows.append(
+            ("Week", f"{format_percent(limits.weekly_percent)}"
+                     f"  ·  resets {limits.weekly_resets or '?'}")
+        )
+    if limits.opus_percent is not None:
+        rows.append(("Opus week", format_percent(limits.opus_percent)))
+    if not limits.ok:
+        rows.append(("Plan usage", limits.status))
+    elif limits.from_cache:
+        rows.append(("Plan usage", "cached"))
+
+    rows += [
         ("Input", f"{usage.input_tokens:,}"),
         ("Output", f"{usage.output_tokens:,}"),
         ("Cache write", f"{usage.cache_creation_tokens:,}"),
@@ -893,18 +1057,8 @@ def build_tooltip(usage: SessionUsage, limits: LimitUsage, cfg: Config) -> str:
         rows.append(("Project", usage.project))
     if usage.session_id:
         rows.append(("Session", usage.session_id[:8]))
-    if limits.session_percent is not None:
-        rows.append(("Plan session", format_percent(limits.session_percent)))
-    if limits.weekly_percent is not None:
-        rows.append(("Plan weekly", format_percent(limits.weekly_percent)))
-    if limits.opus_percent is not None:
-        rows.append(("Opus weekly", format_percent(limits.opus_percent)))
-    if limits.resets_at:
-        rows.append(("Resets", limits.resets_at))
-    if limits.from_cache:
-        rows.append(("Limits", "cached"))
     if not usage.ok:
-        rows.append(("Status", usage.status))
+        rows.append(("Local logs", usage.status))
     if usage.skipped_lines:
         rows.append(("Skipped lines", str(usage.skipped_lines)))
 

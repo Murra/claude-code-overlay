@@ -32,7 +32,6 @@ from PyQt6.QtGui import (
     QColor,
     QCursor,
     QFont,
-    QFontMetrics,
     QGuiApplication,
     QIcon,
     QPainter,
@@ -48,9 +47,6 @@ from parser import (
     SessionUsage,
     UsageMonitor,
     build_tooltip,
-    format_io,
-    format_percent,
-    format_tokens,
     load_cached_limits,
 )
 
@@ -162,6 +158,15 @@ class OverlayWindow(QWidget):
         self.action_reset = QAction("Reset Position", self)
         self.action_reset.triggered.connect(lambda: self.apply_position(reset=True))
 
+        self.action_layout_rows = QAction("Rows", self)
+        self.action_layout_rows.setCheckable(True)
+        self.action_layout_rows.triggered.connect(lambda: self.set_layout("rows"))
+
+        self.action_layout_compact = QAction("Compact", self)
+        self.action_layout_compact.setCheckable(True)
+        self.action_layout_compact.triggered.connect(lambda: self.set_layout("compact"))
+        self._sync_layout_actions()
+
         self.action_cache = QAction("Count Cache Tokens", self)
         self.action_cache.setCheckable(True)
         self.action_cache.setChecked(self.config.parser.include_cache_tokens)
@@ -184,6 +189,10 @@ class OverlayWindow(QWidget):
         menu.addAction(self.action_on_top)
         menu.addAction(self.action_reset)
         menu.addSeparator()
+        layout_menu = menu.addMenu("Layout")
+        layout_menu.setStyleSheet(self._menu_stylesheet())
+        layout_menu.addAction(self.action_layout_rows)
+        layout_menu.addAction(self.action_layout_compact)
         menu.addAction(self.action_cache)
         if self.tray is not None:
             # Without a tray icon there would be no way to bring it back.
@@ -284,8 +293,15 @@ class OverlayWindow(QWidget):
         tooltip = build_tooltip(self.session, self.limits, self.config)
         self.setToolTip(tooltip)
         if self.tray is not None:
-            tokens = format_tokens(self.session, self.config.parser.include_cache_tokens)
-            self.tray.setToolTip(f"{APP_NAME} — {tokens} this session")
+            limits = self.limits
+            if limits.session_percent is None and limits.weekly_percent is None:
+                summary = "plan usage unavailable"
+            else:
+                summary = (
+                    f"session {self._percent_text(limits.session_percent)} · "
+                    f"week {self._percent_text(limits.weekly_percent)}"
+                )
+            self.tray.setToolTip(f"{APP_NAME} — {summary}")
         self.update()
 
     # ----------------------------------------------------------- commands
@@ -299,6 +315,17 @@ class OverlayWindow(QWidget):
         if was_visible:
             self.show()
         self.config.save()
+
+    def _sync_layout_actions(self) -> None:
+        current = self.config.window.layout
+        self.action_layout_rows.setChecked(current == "rows")
+        self.action_layout_compact.setChecked(current == "compact")
+
+    def set_layout(self, name: str) -> None:
+        self.config.window.layout = name
+        self._sync_layout_actions()
+        self.config.save()
+        self.update()
 
     def toggle_cache_tokens(self) -> None:
         self.config.parser.include_cache_tokens = not self.config.parser.include_cache_tokens
@@ -339,13 +366,23 @@ class OverlayWindow(QWidget):
 
         available = screen.availableGeometry()
         full = screen.geometry()
-        # availableGeometry already excludes the taskbar; if the platform gives
-        # us nothing useful, fall back to a fixed taskbar allowance.
-        if available.height() >= full.height():
-            bottom = full.bottom() - win.taskbar_fallback
+
+        if win.anchor_over_taskbar:
+            # Sit inside the taskbar strip: measure from the physical screen
+            # edge, not from the work area, which stops above the taskbar.
+            left = full.left()
+            bottom = full.bottom()
         else:
-            bottom = available.bottom()
-        x = available.left() + win.margin_x
+            left = available.left()
+            # availableGeometry already excludes the taskbar; if the platform
+            # reports nothing useful, fall back to a fixed allowance.
+            bottom = (
+                full.bottom() - win.taskbar_fallback
+                if available.height() >= full.height()
+                else available.bottom()
+            )
+
+        x = left + win.margin_x
         y = bottom - win.height - win.margin_y
         return QPoint(int(x), int(y))
 
@@ -423,109 +460,162 @@ class OverlayWindow(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
 
-        radius = float(win.corner_radius)
         inset = win.border_width / 2.0
         body = QRectF(self.rect()).adjusted(inset, inset, -inset, -inset)
-
-        path = QPainterPath()
-        path.addRoundedRect(body, radius, radius)
-        painter.fillPath(path, QColor(theme.background))
+        shell = QPainterPath()
+        shell.addRoundedRect(body, float(win.corner_radius), float(win.corner_radius))
+        painter.fillPath(shell, QColor(theme.background))
         if win.border_width > 0:
             painter.setPen(QPen(QColor(theme.border), float(win.border_width)))
-            painter.drawPath(path)
+            painter.drawPath(shell)
 
-        pad_x = 11
-        content_width = self.width() - 2 * pad_x
-        headline = self.limits.headline_percent
-        headline_color = QColor(theme.color_for(headline))
-
-        # --- accent dot ------------------------------------------------
-        dot_color = QColor(theme.accent if self.session.ok else theme.text_secondary)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(dot_color))
-        painter.drawEllipse(QRectF(pad_x, 15.0, 6.0, 6.0))
-
-        # --- primary line ----------------------------------------------
-        tokens = format_tokens(self.session, self.config.parser.include_cache_tokens)
-        painter.setFont(self.font_primary)
-        painter.setPen(QPen(QColor(theme.text_primary)))
-        primary_rect = QRectF(pad_x + 13, 8, content_width - 13, 20)
-        painter.drawText(
-            primary_rect,
-            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
-            f"{tokens} tokens",
-        )
-
-        # --- percentage badge (right aligned, same baseline) ------------
-        painter.setFont(self.font_badge)
-        painter.setPen(QPen(headline_color))
-        painter.drawText(
-            primary_rect,
-            int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
-            format_percent(headline),
-        )
-
-        # --- secondary line ---------------------------------------------
-        painter.setFont(self.font_secondary)
-        painter.setPen(QPen(QColor(theme.text_secondary)))
-        secondary_rect = QRectF(pad_x, 28, content_width, 16)
-        detail = format_io(self.session)
-        metrics = QFontMetrics(self.font_secondary)
-        label = self._limit_label()
-        label_width = metrics.horizontalAdvance(label) + 8
-        painter.drawText(
-            QRectF(secondary_rect.left(), secondary_rect.top(),
-                   secondary_rect.width() - label_width, secondary_rect.height()),
-            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
-            metrics.elidedText(
-                detail,
-                Qt.TextElideMode.ElideRight,
-                int(secondary_rect.width() - label_width),
-            ),
-        )
-        painter.drawText(
-            secondary_rect,
-            int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
-            label,
-        )
-
-        # --- progress bar -----------------------------------------------
-        track = QRectF(pad_x, self.height() - 14.0, float(content_width), 4.0)
-        track_path = QPainterPath()
-        track_path.addRoundedRect(track, 2.0, 2.0)
-        painter.fillPath(track_path, QColor("#2a2e33"))
-
-        fraction = self._bar_fraction(headline)
-        if fraction > 0:
-            fill = QRectF(track)
-            fill.setWidth(max(4.0, track.width() * fraction))
-            fill_path = QPainterPath()
-            fill_path.addRoundedRect(fill, 2.0, 2.0)
-            painter.fillPath(fill_path, headline_color)
-
+        painters = {"rows": self._paint_rows, "compact": self._paint_compact}
+        painters.get(win.layout, self._paint_rows)(painter)
         painter.end()
 
-    def _limit_label(self) -> str:
-        """Caption for the percentage badge, reflecting where the number came from."""
-        if self.limits.weekly_percent is not None:
-            return "cached wk" if self.limits.from_cache else "weekly"
-        if self.limits.session_percent is not None:
-            return "cached" if self.limits.from_cache else "plan"
-        if not self.session.ok:
-            return self.session.status.lower()[:14]
-        return "context"
+    # -- shared helpers --------------------------------------------------
 
-    def _bar_fraction(self, headline: Optional[float]) -> float:
-        """Bar tracks plan usage when known, otherwise local context fill."""
-        if headline is not None:
-            return max(0.0, min(1.0, headline / 100.0))
-        context = self.session.context_percent(
-            self.config.parser.context_window_tokens,
-            self.config.parser.include_cache_tokens,
-        )
-        if context is None:
+    def _metrics(self) -> list:
+        """The two limits, in display order: ``(label, percent, countdown)``."""
+        limits = self.limits
+        return [
+            ("SESSION", limits.session_percent, limits.session_countdown()),
+            ("WEEK", limits.weekly_percent, limits.weekly_countdown()),
+        ]
+
+    def _fraction(self, percent: Optional[float]) -> float:
+        if percent is None:
             return 0.0
-        return max(0.0, min(1.0, context / 100.0))
+        return max(0.0, min(1.0, percent / 100.0))
+
+    def _percent_text(self, percent: Optional[float]) -> str:
+        return "--" if percent is None else f"{percent:.0f}%"
+
+    def _countdown_text(self, countdown: str, percent: Optional[float]) -> str:
+        """Reset countdown, or a placeholder when the CLI told us nothing."""
+        if percent is None:
+            return "--"
+        return countdown or "--"
+
+    def _draw_bar(
+        self, painter: QPainter, rect: QRectF, fraction: float, colour: QColor
+    ) -> None:
+        """A rounded track with a rounded fill, clipped so the cap never bleeds."""
+        radius = rect.height() / 2.0
+        track = QPainterPath()
+        track.addRoundedRect(rect, radius, radius)
+        painter.fillPath(track, QColor(self.config.theme.track))
+        if fraction <= 0.0:
+            return
+        fill = QRectF(rect)
+        fill.setWidth(max(rect.height(), rect.width() * fraction))
+        path = QPainterPath()
+        path.addRoundedRect(fill, radius, radius)
+        painter.save()
+        painter.setClipPath(track)
+        painter.fillPath(path, colour)
+        painter.restore()
+
+    # -- layout: rows ----------------------------------------------------
+
+    def _paint_rows(self, painter: QPainter) -> None:
+        """Label, percentage, inline bar and countdown on one line each."""
+        theme = self.config.theme
+        pad_x, pad_y = 10.0, 5.0
+        row_h = (self.height() - pad_y * 2) / 2.0
+        content = self.width() - pad_x * 2
+
+        label_w, value_w, time_w, gap = 44.0, 28.0, 40.0, 8.0
+        bar_w = content - label_w - value_w - time_w - gap * 2
+
+        font_label = QFont(theme.font_family, theme.font_size_label, QFont.Weight.Bold)
+        font_label.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.6)
+        font_value = QFont(theme.font_family, theme.font_size_value, QFont.Weight.DemiBold)
+        font_time = QFont(theme.font_family, theme.font_size_label)
+
+        left_align = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        right_align = int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        for index, (label, percent, countdown) in enumerate(self._metrics()):
+            top = pad_y + index * row_h
+            row = QRectF(pad_x, top, content, row_h)
+            colour = QColor(theme.color_for(percent))
+
+            painter.setFont(font_label)
+            painter.setPen(QPen(QColor(theme.text_secondary)))
+            painter.drawText(QRectF(row.left(), row.top(), label_w, row_h), left_align, label)
+
+            painter.setFont(font_value)
+            painter.setPen(QPen(colour))
+            painter.drawText(
+                QRectF(row.left() + label_w, row.top(), value_w, row_h),
+                right_align,
+                self._percent_text(percent),
+            )
+
+            bar_x = row.left() + label_w + value_w + gap
+            self._draw_bar(
+                painter,
+                QRectF(bar_x, row.center().y() - 1.5, bar_w, 3.0),
+                self._fraction(percent),
+                colour,
+            )
+
+
+            painter.setFont(font_time)
+            painter.setPen(QPen(QColor(theme.text_secondary)))
+            painter.drawText(
+                QRectF(row.right() - time_w, row.top(), time_w, row_h),
+                right_align,
+                self._countdown_text(countdown, percent),
+            )
+
+    # -- layout: compact -------------------------------------------------
+
+    def _paint_compact(self, painter: QPainter) -> None:
+        """Text line with a full-width bar underneath it, twice."""
+        theme = self.config.theme
+        pad_x, pad_y = 10.0, 6.0
+        gap = 4.0
+        block_h = (self.height() - pad_y * 2 - gap) / 2.0
+        content = self.width() - pad_x * 2
+        bar_h = 3.0
+
+        font_label = QFont(theme.font_family, theme.font_size_label, QFont.Weight.Bold)
+        font_label.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.6)
+        font_value = QFont(theme.font_family, theme.font_size_value, QFont.Weight.DemiBold)
+        font_time = QFont(theme.font_family, theme.font_size_label)
+
+        left_align = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        right_align = int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        for index, (label, percent, countdown) in enumerate(self._metrics()):
+            top = pad_y + index * (block_h + gap)
+            colour = QColor(theme.color_for(percent))
+            text_row = QRectF(pad_x, top, content, block_h - bar_h - 2.0)
+
+            painter.setFont(font_label)
+            painter.setPen(QPen(QColor(theme.text_secondary)))
+            painter.drawText(text_row, left_align, label)
+
+            painter.setFont(font_value)
+            painter.setPen(QPen(colour))
+            painter.drawText(
+                QRectF(text_row.left() + 48.0, text_row.top(), 40.0, text_row.height()),
+                left_align,
+                self._percent_text(percent),
+            )
+
+            painter.setFont(font_time)
+            painter.setPen(QPen(QColor(theme.text_secondary)))
+            painter.drawText(text_row, right_align, self._countdown_text(countdown, percent))
+
+            self._draw_bar(
+                painter,
+                QRectF(pad_x, top + block_h - bar_h, content, bar_h),
+                self._fraction(percent),
+                colour,
+            )
 
 
 def parse_args(argv: Optional[list] = None) -> argparse.Namespace:

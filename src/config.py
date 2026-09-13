@@ -37,15 +37,24 @@ LOG_PATH = APP_HOME / "overlay.log"
 class WindowConfig:
     """Geometry and chrome of the frameless overlay."""
 
-    width: int = 220
-    height: int = 65
-    corner_radius: int = 10
+    width: int = 262
+    height: int = 40
+    corner_radius: int = 8
     border_width: int = 1
 
-    #: Left inset from the working-area edge, in device-independent pixels.
-    margin_x: int = 12
-    #: Bottom inset measured from the top of the taskbar.
-    margin_y: int = 12
+    #: Which painter to use: "rows", "tracks" or "compact".
+    layout: str = "rows"
+
+    #: Left inset from the screen edge, in device-independent pixels.
+    margin_x: int = 8
+    #: Bottom inset. Measured from the screen edge when the overlay sits on the
+    #: taskbar, otherwise from the top of the taskbar.
+    margin_y: int = 4
+
+    #: Sit *over* the taskbar rather than above it. The Windows 11 taskbar is
+    #: 48 logical px tall, so a 40 px overlay clears it with 4 px to spare.
+    anchor_over_taskbar: bool = True
+
     #: Extra allowance when the taskbar height cannot be detected.
     taskbar_fallback: int = 48
 
@@ -65,8 +74,9 @@ class WindowConfig:
 class PollingConfig:
     """How often each data source is refreshed, in milliseconds."""
 
-    #: Local ``.jsonl`` session scan — cheap, so it runs often.
-    session_interval_ms: int = 2_000
+    #: Local ``.jsonl`` session scan. This feeds the tooltip breakdown only —
+    #: the overlay face shows plan limits — so it does not need to be fast.
+    session_interval_ms: int = 5_000
     #: CLI status probe — expensive, so it runs rarely.
     cli_interval_ms: int = 120_000
     #: Hard timeout for the CLI subprocess, in seconds.
@@ -97,6 +107,15 @@ class ThemeConfig:
     font_family: str = "Segoe UI"
     font_size_primary: int = 12
     font_size_secondary: int = 9
+
+    #: Type scale for the compact taskbar layout.
+    font_size_value: int = 9
+    font_size_label: int = 7
+
+    #: Unfilled portion of a progress bar.
+    track: str = "#2b3036"
+    #: Row background in the "tracks" layout.
+    row_background: str = "#20242899"
 
     def color_for(self, percent: float | None) -> str:
         """Return the threshold colour for ``percent`` (``None`` -> secondary)."""
