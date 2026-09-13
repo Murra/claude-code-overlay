@@ -84,6 +84,49 @@ def load_app_icon(theme_accent: str = "#d97757") -> QIcon:
     return QIcon(pixmap)
 
 
+#: SetWindowPos arguments — see _reassert_topmost below.
+_HWND_TOPMOST = -1
+_SWP_NOSIZE = 0x0001
+_SWP_NOMOVE = 0x0002
+_SWP_NOACTIVATE = 0x0010
+_SWP_NOOWNERZORDER = 0x0200
+
+#: SetWinEventHook arguments — see _install_foreground_hook below.
+_EVENT_SYSTEM_FOREGROUND = 0x0003
+_WINEVENT_OUTOFCONTEXT = 0x0000
+_WINEVENT_SKIPOWNPROCESS = 0x0002
+
+
+def _user32():
+    """user32 with the signatures we need declared explicitly.
+
+    ctypes marshals an undeclared Python ``int`` as a 32-bit C ``int``. On x64
+    that turns ``HWND_TOPMOST`` (-1) into ``0x00000000FFFFFFFF`` rather than a
+    sign-extended ``0xFFFFFFFFFFFFFFFF``, so SetWindowPos rejects it and
+    returns 0 — silently, if you do not check. Handles must therefore be passed
+    as ``wintypes.HWND``, and pointer-sized return values must be declared or
+    they are truncated.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    if getattr(user32, "_overlay_signatures_ready", False):
+        return user32
+
+    user32.SetWindowPos.argtypes = [
+        wintypes.HWND, wintypes.HWND,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_uint,
+    ]
+    user32.SetWindowPos.restype = wintypes.BOOL
+    user32.SetWinEventHook.restype = ctypes.c_void_p
+    user32.UnhookWinEvent.argtypes = [ctypes.c_void_p]
+    user32.UnhookWinEvent.restype = wintypes.BOOL
+    user32._overlay_signatures_ready = True
+    return user32
+
+
 def set_windows_app_id(app_id: str = "claude.code.overlay.1") -> None:
     """Give Windows a stable AppUserModelID so the tray icon groups correctly."""
     if os.name != "nt":
@@ -106,6 +149,7 @@ class OverlayWindow(QWidget):
         self._dragging = False
         self._menu: Optional[QMenu] = None
         self.tray: Optional[QSystemTrayIcon] = None
+        self._topmost_failed = False
 
         self.session = SessionUsage(status="Scanning...")
         self.limits = load_cached_limits()
@@ -258,6 +302,101 @@ class OverlayWindow(QWidget):
 
     # ------------------------------------------------------------ polling
 
+    def _reassert_topmost(self) -> None:
+        """Push the overlay back to the top of the topmost band.
+
+        The taskbar (``Shell_TrayWnd``) is a topmost window too, and topmost
+        windows are ordered among themselves by activation — so clicking the
+        taskbar raises it above the overlay, which then looks like it has
+        vanished. Qt's WindowStaysOnTopHint only sets the style at creation; it
+        does not defend the position. SWP_NOACTIVATE keeps focus where it is,
+        so re-asserting never steals the click the user just made.
+        """
+        if os.name != "nt" or not self.config.window.always_on_top:
+            return
+        if not self.isVisible():
+            return
+        try:
+            from ctypes import wintypes
+
+            user32 = _user32()
+            ok = user32.SetWindowPos(
+                wintypes.HWND(int(self.winId())),
+                wintypes.HWND(_HWND_TOPMOST),
+                0, 0, 0, 0,
+                _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE | _SWP_NOOWNERZORDER,
+            )
+            if not ok and not self._topmost_failed:
+                # Log once rather than every second.
+                self._topmost_failed = True
+                log.warning("SetWindowPos(HWND_TOPMOST) failed; overlay may fall behind")
+        except Exception:  # pragma: no cover - cosmetic, never fatal
+            log.debug("Could not re-assert topmost", exc_info=True)
+
+    def _install_foreground_hook(self) -> None:
+        """Re-assert topmost the instant another window takes the foreground.
+
+        The polling timer alone leaves up to one interval during which the
+        taskbar covers the overlay, which is exactly the flicker the timer is
+        supposed to prevent. EVENT_SYSTEM_FOREGROUND fires the moment the user
+        clicks the taskbar, so the correction lands in the same frame.
+
+        Delivery is WINEVENT_OUTOFCONTEXT, so the callback arrives on this
+        thread through the normal message queue and it is safe to touch the
+        window from it.
+        """
+        self._win_event_hook = None
+        self._win_event_proc = None
+        if os.name != "nt" or self.config.window.topmost_interval_ms <= 0:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            prototype = ctypes.WINFUNCTYPE(
+                None,
+                wintypes.HANDLE,
+                wintypes.DWORD,
+                wintypes.HWND,
+                wintypes.LONG,
+                wintypes.LONG,
+                wintypes.DWORD,
+                wintypes.DWORD,
+            )
+
+            def on_foreground(*_args) -> None:
+                try:
+                    self._reassert_topmost()
+                except Exception:  # pragma: no cover - must never raise into Win32
+                    pass
+
+            # The callback must outlive the hook: ctypes does not keep a
+            # reference, and a collected thunk means a crash when it fires.
+            self._win_event_proc = prototype(on_foreground)
+            self._win_event_hook = _user32().SetWinEventHook(
+                _EVENT_SYSTEM_FOREGROUND,
+                _EVENT_SYSTEM_FOREGROUND,
+                None,
+                self._win_event_proc,
+                0,
+                0,
+                _WINEVENT_OUTOFCONTEXT | _WINEVENT_SKIPOWNPROCESS,
+            )
+            if not self._win_event_hook:
+                log.debug("SetWinEventHook failed; falling back to the timer alone")
+        except Exception:  # pragma: no cover - cosmetic, never fatal
+            log.debug("Could not install foreground hook", exc_info=True)
+
+    def _remove_foreground_hook(self) -> None:
+        if not getattr(self, "_win_event_hook", None):
+            return
+        try:
+            _user32().UnhookWinEvent(self._win_event_hook)
+        except Exception:  # pragma: no cover
+            pass
+        self._win_event_hook = None
+        self._win_event_proc = None
+
     def _build_monitor(self) -> None:
         self.monitor = UsageMonitor(self.config, self)
         self.monitor.session_ready.connect(self._on_session)
@@ -272,9 +411,17 @@ class OverlayWindow(QWidget):
         self.cli_timer.setInterval(max(10_000, polling.cli_interval_ms))
         self.cli_timer.timeout.connect(self.monitor.refresh_limits)
 
+        self.topmost_timer = QTimer(self)
+        self.topmost_timer.setInterval(max(250, self.config.window.topmost_interval_ms))
+        self.topmost_timer.timeout.connect(self._reassert_topmost)
+
     def start(self) -> None:
         self.session_timer.start()
         self.cli_timer.start()
+        if self.config.window.topmost_interval_ms > 0:
+            self.topmost_timer.start()
+            self._install_foreground_hook()
+            self._reassert_topmost()
         QTimer.singleShot(0, self.monitor.refresh_session)
         QTimer.singleShot(400, self.monitor.refresh_limits)
 
@@ -314,6 +461,8 @@ class OverlayWindow(QWidget):
         self.setWindowFlags(self._window_flags())
         if was_visible:
             self.show()
+        if self.config.window.always_on_top:
+            self._reassert_topmost()
         self.config.save()
 
     def _sync_layout_actions(self) -> None:
@@ -339,6 +488,7 @@ class OverlayWindow(QWidget):
         else:
             self.show()
             self.raise_()
+            self._reassert_topmost()
 
     def apply_position(self, reset: bool = False) -> None:
         """Move to the stored custom position, or re-anchor to bottom-left."""
@@ -444,6 +594,8 @@ class OverlayWindow(QWidget):
     def closeEvent(self, event) -> None:
         self.session_timer.stop()
         self.cli_timer.stop()
+        self.topmost_timer.stop()
+        self._remove_foreground_hook()
         self.monitor.shutdown()
         if self.tray is not None:
             self.tray.hide()

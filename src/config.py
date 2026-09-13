@@ -63,6 +63,18 @@ class WindowConfig:
     pos_y: int | None = None
 
     always_on_top: bool = True
+
+    #: How often to re-assert topmost z-order, in milliseconds (0 disables).
+    #: The Windows taskbar is itself a topmost window, so clicking it raises it
+    #: above the overlay and the overlay appears to vanish. Qt's
+    #: WindowStaysOnTopHint sets the style once; it does not defend the
+    #: position afterwards.
+    #:
+    #: This is the backstop, and it bounds the worst-case flicker: a foreground
+    #: hook normally corrects the z-order the moment the taskbar is clicked.
+    #: The call is a single cheap SetWindowPos, so polling twice a second costs
+    #: nothing measurable.
+    topmost_interval_ms: int = 500
     start_hidden: bool = False
     show_tray_icon: bool = True
     opacity: float = 0.94

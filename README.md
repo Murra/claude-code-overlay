@@ -193,6 +193,7 @@ than fatal — so it is safe to edit by hand.
     "pos_x": null,               // set automatically when you drag the widget
     "pos_y": null,
     "always_on_top": true,
+    "topmost_interval_ms": 500,  // re-assert z-order; 0 disables (see below)
     "start_hidden": false,
     "show_tray_icon": true,
     "opacity": 0.94
@@ -228,6 +229,29 @@ than fatal — so it is safe to edit by hand.
 
 Set `CLAUDE_CONFIG_DIR` to point the parser at a Claude Code state directory other than
 `~/.claude` — the same variable Claude Code itself honours.
+
+### Staying above the taskbar
+
+`WindowStaysOnTopHint` is not enough on its own. The Windows taskbar is a topmost window too,
+and topmost windows are ordered among themselves by activation — so clicking the taskbar raises
+it above the overlay, which then looks like it has vanished. Qt sets the style once and does not
+defend the position afterwards.
+
+The overlay therefore re-asserts its own z-order two ways:
+
+- A `SetWinEventHook` on `EVENT_SYSTEM_FOREGROUND` corrects the z-order as soon as another
+  window takes the foreground, which is what clicking the taskbar does.
+- A `SetWindowPos(HWND_TOPMOST, …, SWP_NOACTIVATE)` call on a `topmost_interval_ms` timer backs
+  that up and bounds the worst case. `SWP_NOACTIVATE` matters: re-asserting never steals the
+  click you just made.
+
+One trap worth recording, since it cost a debugging cycle here. `ctypes` marshals an undeclared
+Python `int` as a 32-bit C `int`, so passing `HWND_TOPMOST` (-1) straight through produces
+`0x00000000FFFFFFFF` on x64 instead of a sign-extended handle. `SetWindowPos` then returns 0 and
+does nothing — silently, unless you check. Handles are passed as `wintypes.HWND` with explicit
+`argtypes`, and a failed call is logged once.
+
+Set `topmost_interval_ms` to `0` to switch both off.
 
 ## Architecture
 
@@ -413,6 +437,7 @@ with nothing but the standard library, so you can change the colours and re-run 
 | Overlay is off-screen after a monitor change | Right-click → **Reset Position**, or run with `--reset-position`. |
 | Nothing appears at all | Check `~/.claude-code-overlay/overlay.log`, or run `python src/main.py --verbose`. |
 | Hidden behind a fullscreen game | Exclusive-fullscreen apps bypass every always-on-top window. Use borderless windowed mode. |
+| Overlay disappears when you click the taskbar | Should not happen — the overlay re-asserts its z-order. If it does, check that `window.topmost_interval_ms` is not `0`. |
 
 ## Privacy
 
