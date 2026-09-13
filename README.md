@@ -44,7 +44,7 @@ cache breakdown belongs.
 |---|---|
 | **Both limits at a glance** | Session and weekly usage, each with its own progress bar, threshold colour and countdown to reset. |
 | **Reset countdowns** | `4h 12m`, `5d 17h` — parsed from the CLI's absolute stamps, because "how long have I got" beats "Sep 19, 12pm". |
-| **Fits the taskbar** | 262x40, anchored bottom-left over the taskbar, DPI-correct on mixed-scaling multi-monitor setups. |
+| **Fits the taskbar** | 262x40, anchored bottom-left over the taskbar, DPI-correct on mixed-scaling multi-monitor setups. One click parks it just above instead. |
 | **Token detail on hover** | Input, output and both cache counters, de-duplicated by request ID, read from `~/.claude/projects/**/*.jsonl`. |
 | **Finds WSL sessions** | Runs Claude Code inside WSL? The Windows overlay auto-discovers `\\wsl.localhost\<distro>\home\<user>\.claude` and merges it in. |
 | **Always visible, never in the way** | `Tool` window flag keeps it off the taskbar and out of Alt-Tab. Stays on top until you toggle it off. |
@@ -110,7 +110,7 @@ Python 3.10–3.14. PyQt6 ships prebuilt wheels for all of them, so nothing is c
 | Left-drag | Move the overlay. The position is saved on release. |
 | Double-click | Force an immediate refresh. |
 | Scroll wheel | Fade in / out. |
-| Right-click | Refresh Now · Always on Top · Reset Position · Layout ▸ · Count Cache Tokens · Hide · Exit |
+| Right-click | Refresh Now · Always on Top · Reset Position · Layout ▸ · Dock Over Taskbar · Count Cache Tokens · Hide · Exit |
 | Hover | Tooltip with both limits and their reset times, plus the token breakdown: input, output, cache read/write, message count, model, project and session ID. |
 | Tray click | Show / hide the overlay. |
 
@@ -252,6 +252,34 @@ does nothing — silently, unless you check. Handles are passed as `wintypes.HWN
 `argtypes`, and a failed call is logged once.
 
 Set `topmost_interval_ms` to `0` to switch both off.
+
+### The one case this cannot fix
+
+While the **Start menu, Search, or another shell flyout is open**, Windows raises the taskbar
+into an immersive z-order band that a normal application cannot enter. The overlay is covered
+for as long as that surface is open, and reappears the moment it closes.
+
+This is not a bug that can be worked around from user code. Measured with `WindowFromPoint` at
+the overlay's own centre pixel, with the Start menu open:
+
+```
+SetWindowPos(overlay, HWND_TOPMOST)   rc=1  -> still covered
+SetWindowPos(taskbar, after=overlay)  rc=1  -> still covered
+BringWindowToTop(overlay)             rc=1  -> still covered
+```
+
+Every call reports success and none of them changes what is painted. Entering that band
+requires a `uiAccess="true"` manifest, which in turn requires a binary signed by a trusted
+certificate and installed under `Program Files` — not something a portable open-source `.exe`
+can or should do.
+
+**If this bothers you, right-click → untick "Dock Over Taskbar".** The overlay then parks just
+above the taskbar and stays visible through everything, at the cost of ~44px of desktop in the
+bottom-left corner. Verified against the Start menu, Search and File Explorer.
+
+Note that ordinary windows never cause this. Opening File Explorer, maximising a browser, or
+clicking a taskbar button to raise an app all leave the overlay alone, or cover it only for the
+~200ms the re-assert takes.
 
 ## Architecture
 
@@ -437,7 +465,8 @@ with nothing but the standard library, so you can change the colours and re-run 
 | Overlay is off-screen after a monitor change | Right-click → **Reset Position**, or run with `--reset-position`. |
 | Nothing appears at all | Check `~/.claude-code-overlay/overlay.log`, or run `python src/main.py --verbose`. |
 | Hidden behind a fullscreen game | Exclusive-fullscreen apps bypass every always-on-top window. Use borderless windowed mode. |
-| Overlay disappears when you click the taskbar | Should not happen — the overlay re-asserts its z-order. If it does, check that `window.topmost_interval_ms` is not `0`. |
+| Overlay disappears when you click the taskbar | It should return within ~200ms. If it does not, check that `window.topmost_interval_ms` is not `0`. |
+| Overlay hidden while the Start menu is open | Expected, and not fixable from user code — see [The one case this cannot fix](#the-one-case-this-cannot-fix). Right-click → untick **Dock Over Taskbar** to avoid it entirely. |
 
 ## Privacy
 

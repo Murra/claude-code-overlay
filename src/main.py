@@ -211,6 +211,11 @@ class OverlayWindow(QWidget):
         self.action_layout_compact.triggered.connect(lambda: self.set_layout("compact"))
         self._sync_layout_actions()
 
+        self.action_dock = QAction("Dock Over Taskbar", self)
+        self.action_dock.setCheckable(True)
+        self.action_dock.setChecked(self.config.window.anchor_over_taskbar)
+        self.action_dock.triggered.connect(self.toggle_dock_over_taskbar)
+
         self.action_cache = QAction("Count Cache Tokens", self)
         self.action_cache.setCheckable(True)
         self.action_cache.setChecked(self.config.parser.include_cache_tokens)
@@ -237,6 +242,7 @@ class OverlayWindow(QWidget):
         layout_menu.setStyleSheet(self._menu_stylesheet())
         layout_menu.addAction(self.action_layout_rows)
         layout_menu.addAction(self.action_layout_compact)
+        menu.addAction(self.action_dock)
         menu.addAction(self.action_cache)
         if self.tray is not None:
             # Without a tray icon there would be no way to bring it back.
@@ -475,6 +481,22 @@ class OverlayWindow(QWidget):
         self._sync_layout_actions()
         self.config.save()
         self.update()
+
+    def toggle_dock_over_taskbar(self) -> None:
+        """Move between sitting on the taskbar and sitting just above it.
+
+        Sitting on the taskbar costs no desktop space but loses a fight the
+        overlay cannot win: while a shell surface such as the Start menu is
+        open, Windows raises the taskbar into an immersive z-order band that a
+        normal application cannot exceed, so the overlay is covered until the
+        menu closes. Parking it just above the taskbar avoids that entirely.
+        """
+        window = self.config.window
+        window.anchor_over_taskbar = not window.anchor_over_taskbar
+        self.action_dock.setChecked(window.anchor_over_taskbar)
+        # A custom dragged position would otherwise override the new anchor.
+        self.apply_position(reset=True)
+        self._reassert_topmost()
 
     def toggle_cache_tokens(self) -> None:
         self.config.parser.include_cache_tokens = not self.config.parser.include_cache_tokens
