@@ -1,13 +1,20 @@
 # Media
 
-`demo.gif` is referenced from the project README and is not committed yet.
+These images are generated from the real widget, not mocked up, so they stay honest when the
+design changes.
 
-To record a replacement:
+| File | Used for |
+|---|---|
+| `screenshot.png` | README header. The overlay composited into a taskbar strip. |
+| `thresholds.png` | The four display states: green, amber, red, and no-CLI-data. |
 
-1. Start a Claude Code session so the counter has something to climb.
-2. Capture the bottom-left corner of the screen — [ScreenToGif](https://www.screentogif.com/)
-   works well on Windows. Around 640px wide, 6–8 seconds, 15 fps.
-3. Save it here as `docs/demo.gif`.
+## Regenerating them
 
-Worth showing in the capture: the token count rising mid-response, the threshold colour
-changing, and the right-click menu opening.
+Both are produced by rendering the actual `OverlayWindow` and calling `QWidget.grab()`, then
+compositing the result. The surrounding taskbar in `screenshot.png` is drawn — abstract rounded
+squares standing in for pinned icons, no logos and nothing imitating a real product — so that no
+part of a real desktop ends up in the repository.
+
+If you change the layout or palette, re-render rather than editing the PNGs by hand. The widget
+renders at the display's device pixel ratio, so a 2x screen produces the 524x80 images checked in
+here for a 262x40 window.

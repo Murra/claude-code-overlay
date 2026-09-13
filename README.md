@@ -9,10 +9,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg?style=flat-square)](https://www.python.org/downloads/)
 [![Build](https://img.shields.io/github/actions/workflow/status/Murra/claude-code-overlay/release.yml?style=flat-square)](../../actions)
 
-<!-- Replace with a real capture: 220x65 overlay in the bottom-left corner while a Claude Code session runs. -->
-<img src="docs/demo.gif" alt="Claude Code Overlay running in the bottom-left corner of a Windows 11 desktop" width="640">
-
-*Add `docs/demo.gif` — a ~6 second capture of the counter climbing during a live session.*
+<img src="docs/screenshot.png" alt="The overlay sitting in the bottom-left of the Windows 11 taskbar, showing session usage at 34% with 2h 59m until reset and weekly usage at 62% with 5d 16h until reset" width="760">
 
 </div>
 
@@ -51,9 +48,16 @@ cache breakdown belongs.
 | **Always visible, never in the way** | `Tool` window flag keeps it off the taskbar and out of Alt-Tab. Stays on top until you toggle it off. |
 | **Drag anywhere** | Anchored bottom-left by default; drag it somewhere else and the position sticks. |
 | **Threshold colours** | Green under 60%, amber under 85%, red above — per bar, so a hot session reads red while the week stays green. |
+
 | **Tray icon** | Show/hide, refresh, or start minimized with `--minimized`. |
 | **Scroll to fade** | Mouse-wheel over the widget adjusts opacity. |
 | **Never crashes on bad data** | Missing logs, truncated lines, locked files and CLI timeouts all degrade to `--` or a short status string. |
+
+<img src="docs/thresholds.png" alt="The overlay in four states: comfortable with both bars green, getting warm with the session bar amber, nearly out with both bars red, and no CLI data with both values showing two dashes" width="688">
+
+Each bar is coloured independently, so a session you are burning through reads amber or red while
+the week beside it stays green. When the CLI reports nothing, both rows fall back to `--` rather
+than inventing a number.
 
 ## Quick start
 
