@@ -1,10 +1,20 @@
-# Runtime
-PyQt6==6.7.1
-PyQt6-Qt6==6.7.3
-PyQt6-sip==13.8.0
+# Ranges rather than exact pins, deliberately.
+#
+# PyQt6 and PyInstaller both publish per-Python-version wheels and each release
+# supports only a window of interpreters: pyinstaller 6.11 declares
+# `python <3.14`, and PyQt6-sip has no 3.14 wheel until 13.10. Hard-pinning
+# either one makes `pip install -r requirements.txt` fall back to a source build
+# (and fail without a compiler) on any Python newer than the pin. Letting pip
+# resolve within a range keeps the project installable on 3.10 through 3.14.
+#
+# For a byte-reproducible environment, generate a lock file instead:
+#     pip install -r requirements.txt && pip freeze > requirements.lock.txt
+
+# Runtime — PyQt6 pulls in matching PyQt6-Qt6 and PyQt6-sip builds itself.
+PyQt6>=6.7,<7
 
 # Packaging
-pyinstaller==6.11.1
+pyinstaller>=6.11
 
 # Development / CI
-pytest==8.3.4
+pytest>=8

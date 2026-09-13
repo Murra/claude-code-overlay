@@ -14,14 +14,27 @@ from config import Config, ParserConfig, PollingConfig  # noqa: E402
 from parser import (  # noqa: E402
     LimitUsage,
     SessionUsage,
+    _decode_console,
     collect_session_usage,
     find_latest_session_file,
     format_percent,
     format_tokens,
     iter_session_files,
+    list_wsl_distros,
     parse_limit_output,
     parse_session_file,
+    UsageMonitor,
+    reset_discovery_cache,
+    resolve_projects_dirs,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_discovery_cache():
+    """Directory discovery is cached process-wide; isolate every test from it."""
+    reset_discovery_cache()
+    yield
+    reset_discovery_cache()
 
 
 def _assistant(request_id: str, inp: int, out: int, cc: int = 0, cr: int = 0) -> str:
@@ -121,7 +134,7 @@ def test_missing_file_is_not_fatal(tmp_path: Path) -> None:
 
 
 def test_missing_projects_dir_is_not_fatal(tmp_path: Path) -> None:
-    cfg = ParserConfig(projects_dir=str(tmp_path / "absent"))
+    cfg = ParserConfig(projects_dir=str(tmp_path / "absent"), auto_discover_wsl=False)
     usage = collect_session_usage(cfg, PollingConfig())
     assert not usage.ok
     assert usage.status == "No ~/.claude logs"
@@ -147,10 +160,85 @@ def test_combined_mode_sums_across_recent_sessions(tmp_path: Path, session_file:
     (projects / "-c-b").mkdir()
     (projects / "-c-b" / "s2.jsonl").write_text(_assistant("req_7", 7, 3) + "\n", encoding="utf-8")
 
-    cfg = ParserConfig(projects_dir=str(projects), latest_session_only=False)
+    cfg = ParserConfig(
+        projects_dir=str(projects), latest_session_only=False, auto_discover_wsl=False
+    )
     usage = collect_session_usage(cfg, PollingConfig())
     assert usage.input_tokens == 127
     assert usage.output_tokens == 83
+
+
+def test_skips_probe_transcripts_that_contain_no_usage(tmp_path: Path) -> None:
+    """Regression test for the overlay reporting zero tokens forever.
+
+    ``claude -p /usage`` — the CLI probe this app runs to read plan limits —
+    writes a brand-new transcript every time it is invoked, containing no
+    assistant turns. It is therefore always the newest file on disk. Taking
+    "newest file" literally locks the overlay onto an empty session while the
+    user's real conversation sits one slot down.
+    """
+    import os
+    import time
+
+    projects = tmp_path / "projects"
+    real = projects / "real-project"
+    probe = projects / "probe-project"
+    real.mkdir(parents=True)
+    probe.mkdir(parents=True)
+
+    (real / "real.jsonl").write_text(_assistant("r1", 500, 250), encoding="utf-8")
+    # What a probe transcript looks like: metadata rows, no assistant usage.
+    (probe / "probe.jsonl").write_text(
+        json.dumps({"type": "user", "message": {"role": "user", "content": "/usage"}}) + "\n"
+        + json.dumps({"type": "summary", "summary": "usage check"}) + "\n",
+        encoding="utf-8",
+    )
+    newer = time.time() + 120
+    os.utime(probe / "probe.jsonl", (newer, newer))
+
+    cfg = ParserConfig(projects_dir=str(projects), auto_discover_wsl=False)
+    usage = collect_session_usage(cfg, PollingConfig())
+
+    assert usage.input_tokens == 500, "the empty probe transcript masked the real session"
+    assert usage.output_tokens == 250
+    assert usage.project == "real-project"
+
+
+def test_reports_no_usage_yet_when_every_candidate_is_empty(tmp_path: Path) -> None:
+    projects = tmp_path / "projects" / "p"
+    projects.mkdir(parents=True)
+    (projects / "a.jsonl").write_text(
+        json.dumps({"type": "user", "message": {"role": "user", "content": "hi"}}) + "\n",
+        encoding="utf-8",
+    )
+    cfg = ParserConfig(projects_dir=str(tmp_path / "projects"), auto_discover_wsl=False)
+    usage = collect_session_usage(cfg, PollingConfig())
+    assert usage.ok
+    assert usage.status == "No usage yet"
+    assert usage.input_tokens == 0
+
+
+def test_candidate_search_is_bounded(tmp_path: Path) -> None:
+    """A long tail of empty transcripts must not be parsed end to end."""
+    import os
+    import time
+
+    projects = tmp_path / "projects" / "p"
+    projects.mkdir(parents=True)
+    (projects / "old-real.jsonl").write_text(_assistant("r", 9, 9), encoding="utf-8")
+    for i in range(12):
+        empty = projects / f"empty{i:02d}.jsonl"
+        empty.write_text(json.dumps({"type": "user"}) + "\n", encoding="utf-8")
+        stamp = time.time() + 60 + i
+        os.utime(empty, (stamp, stamp))
+
+    cfg = ParserConfig(
+        projects_dir=str(tmp_path / "projects"),
+        auto_discover_wsl=False,
+        max_session_candidates=3,
+    )
+    usage = collect_session_usage(cfg, PollingConfig())
+    assert usage.status == "No usage yet", "search must stop after max_session_candidates"
 
 
 def test_context_percent_is_clamped() -> None:
@@ -159,11 +247,50 @@ def test_context_percent_is_clamped() -> None:
     assert SessionUsage(ok=False).context_percent(200_000, include_cache=False) is None
 
 
+#: Verbatim output of ``claude -p /usage`` (2026-09), the command the probe
+#: actually relies on. Tests are written against this rather than an invented
+#: format so a change upstream shows up here first.
+REAL_USAGE_OUTPUT = (
+    "You are currently using your subscription to power your Claude Code usage\n"
+    "\n"
+    "Current session: 17% used \u00b7 resets Sep 13, 10:20pm (America/New_York)\n"
+    "Current week (all models): 24% used \u00b7 resets Sep 19, 12pm (America/New_York)\n"
+)
+
+
+def test_parses_real_usage_output() -> None:
+    limits = parse_limit_output(REAL_USAGE_OUTPUT)
+    assert limits.ok
+    assert limits.session_percent == 17.0
+    assert limits.weekly_percent == 24.0
+    assert limits.opus_percent is None
+    assert limits.headline_percent == 24.0
+
+
+def test_reset_stamp_comes_from_the_line_that_is_displayed() -> None:
+    """The badge shows the weekly figure, so it must show the weekly reset."""
+    limits = parse_limit_output(REAL_USAGE_OUTPUT)
+    assert limits.resets_at == "Sep 19, 12pm (America/New_York)"
+
+
+def test_reset_stamp_falls_back_to_session_line() -> None:
+    limits = parse_limit_output("Current session: 17% used \u00b7 resets Sep 13, 10:20pm")
+    assert limits.session_percent == 17.0
+    assert limits.resets_at == "Sep 13, 10:20pm"
+
+
+def test_status_unavailable_message_is_not_mistaken_for_data() -> None:
+    """``claude -p /status`` answers this; it must not read as a usage figure."""
+    limits = parse_limit_output("/status isn't available in this environment.\n")
+    assert not limits.ok
+    assert limits.headline_percent is None
+
+
 @pytest.mark.parametrize(
     "text, weekly, session",
     [
         ("Current session: 12% used\nWeekly limit: 47% used", 47.0, 12.0),
-        ("\x1b[32mWeekly (all models): 8.5%\x1b[0m", 8.5, None),
+        ("\x1b[32mCurrent week (all models): 8.5% used\x1b[0m", 8.5, None),
         ("nothing useful here", None, None),
         ("", None, None),
         ("Weekly limit: 400%", None, None),
@@ -177,10 +304,23 @@ def test_parse_limit_output(text: str, weekly, session) -> None:
 
 
 def test_parse_limit_output_prefers_opus_line() -> None:
-    limits = parse_limit_output("Weekly limit: 30%\nOpus weekly limit: 12%")
+    limits = parse_limit_output(
+        "Current week (all models): 30% used\nCurrent week (Opus): 12% used"
+    )
     assert limits.weekly_percent == 30.0
     assert limits.opus_percent == 12.0
     assert limits.headline_percent == 30.0
+
+
+def test_decode_output_handles_non_utf8_console_bytes() -> None:
+    from parser import _decode_output
+
+    line = "Current week (all models): 24% used \u00b7 resets Sep 19"
+    assert _decode_output(line.encode("utf-8")) == line
+    # cp1252 bytes are not valid UTF-8; they must not become replacement chars.
+    assert "\ufffd" not in _decode_output(line.encode("cp1252"))
+    assert _decode_output(None) == ""
+    assert _decode_output(b"") == ""
 
 
 def test_limit_cache_roundtrip() -> None:
@@ -222,3 +362,194 @@ def test_theme_thresholds() -> None:
     assert theme.color_for(10.0) == theme.ok_color
     assert theme.color_for(70.0) == theme.warn_color
     assert theme.color_for(95.0) == theme.critical_color
+
+
+# --------------------------------------------------------------------------- #
+# Directory discovery (Windows overlay + Claude Code running inside WSL)
+# --------------------------------------------------------------------------- #
+
+
+def test_decode_console_handles_utf16_from_wsl_exe() -> None:
+    assert _decode_console(b"U\x00b\x00u\x00n\x00t\x00u\x00") == "Ubuntu"
+    assert _decode_console("Debian\n".encode("utf-8")) == "Debian\n"
+    assert _decode_console(b"") == ""
+
+
+def test_list_wsl_distros_is_empty_off_windows(monkeypatch) -> None:
+    monkeypatch.setattr("parser.os.name", "posix")
+    assert list_wsl_distros() == []
+
+
+def test_resolve_merges_extras_and_deduplicates(tmp_path: Path) -> None:
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    primary.mkdir()
+    secondary.mkdir()
+
+    cfg = ParserConfig(
+        projects_dir=str(primary),
+        extra_projects_dirs=[str(secondary), str(primary), str(tmp_path / "absent")],
+        auto_discover_wsl=False,
+    )
+    assert resolve_projects_dirs(cfg) == [primary, secondary]
+
+
+def test_resolve_skips_wsl_when_disabled(tmp_path: Path, monkeypatch) -> None:
+    called = []
+    monkeypatch.setattr("parser.discover_wsl_projects_dirs", lambda t: called.append(t) or [])
+    cfg = ParserConfig(projects_dir=str(tmp_path), auto_discover_wsl=False)
+    resolve_projects_dirs(cfg)
+    assert called == []
+
+
+def test_resolve_includes_discovered_wsl_dirs(tmp_path: Path, monkeypatch) -> None:
+    wsl_like = tmp_path / "wsl-home" / ".claude" / "projects"
+    wsl_like.mkdir(parents=True)
+    monkeypatch.setattr("parser.discover_wsl_projects_dirs", lambda t: [wsl_like])
+    cfg = ParserConfig(projects_dir=str(tmp_path / "absent"), auto_discover_wsl=True)
+    assert resolve_projects_dirs(cfg) == [wsl_like]
+
+
+def test_discovery_cache_invalidates_when_config_changes(tmp_path: Path) -> None:
+    first = tmp_path / "one"
+    second = tmp_path / "two"
+    first.mkdir()
+    second.mkdir()
+
+    assert resolve_projects_dirs(
+        ParserConfig(projects_dir=str(first), auto_discover_wsl=False)
+    ) == [first]
+    assert resolve_projects_dirs(
+        ParserConfig(projects_dir=str(second), auto_discover_wsl=False)
+    ) == [second], "a changed projects_dir must not serve the cached result"
+
+
+def test_iter_session_files_accepts_multiple_roots(tmp_path: Path) -> None:
+    roots = []
+    for name in ("a", "b"):
+        root = tmp_path / name
+        (root / "proj").mkdir(parents=True)
+        (root / "proj" / f"{name}.jsonl").write_text(_assistant("r", 1, 1), encoding="utf-8")
+        roots.append(root)
+
+    assert len(iter_session_files(roots)) == 2
+    assert len(iter_session_files(roots[0])) == 1, "a single Path must still work"
+    assert iter_session_files([tmp_path / "absent"]) == []
+
+
+def test_collect_merges_across_roots(tmp_path: Path) -> None:
+    windows = tmp_path / "win" / "proj"
+    wsl = tmp_path / "wsl" / "proj"
+    windows.mkdir(parents=True)
+    wsl.mkdir(parents=True)
+    (windows / "w.jsonl").write_text(_assistant("r1", 10, 5), encoding="utf-8")
+    (wsl / "l.jsonl").write_text(_assistant("r2", 3, 2), encoding="utf-8")
+
+    cfg = ParserConfig(
+        projects_dir=str(tmp_path / "win"),
+        extra_projects_dirs=[str(tmp_path / "wsl")],
+        auto_discover_wsl=False,
+        latest_session_only=False,
+    )
+    usage = collect_session_usage(cfg, PollingConfig())
+    assert usage.input_tokens == 13
+    assert usage.output_tokens == 7
+
+
+# --------------------------------------------------------------------------- #
+# Worker plumbing
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(scope="session")
+def qt_app():
+    """A QCoreApplication is enough for QThread; no display server needed."""
+    from PyQt6.QtCore import QCoreApplication
+
+    yield QCoreApplication.instance() or QCoreApplication([])
+
+
+def _pump(monitor, signal, timeout_ms=10_000):
+    """Spin an event loop until ``signal`` fires or the timeout expires."""
+    from PyQt6.QtCore import QEventLoop, QTimer
+
+    received = []
+    loop = QEventLoop()
+    signal.connect(received.append)
+    signal.connect(lambda *_: loop.quit())
+    QTimer.singleShot(timeout_ms, loop.quit)
+    return received, loop
+
+
+def test_monitor_actually_runs_its_session_worker(qt_app, session_file: Path) -> None:
+    """Regression test for a silent PyQt lifetime bug.
+
+    The worker is moveToThread'd, so it cannot have a parent. If UsageMonitor
+    does not also hold a Python reference, the worker is garbage-collected the
+    instant refresh_session() returns: the thread starts, the started -> run
+    connection is already dead, nothing ever runs and no error is raised
+    anywhere. The overlay just shows "Scanning..." forever.
+    """
+    cfg = Config()
+    cfg.parser.projects_dir = str(session_file.parents[1])
+    cfg.parser.auto_discover_wsl = False
+
+    monitor = UsageMonitor(cfg)
+    received, loop = _pump(monitor, monitor.session_ready)
+    monitor.refresh_session()
+    assert monitor._session_worker is not None, "worker reference must be retained"
+    loop.exec()
+    monitor.shutdown()
+
+    assert received, "session_ready never fired — the worker did not run"
+    assert received[0].input_tokens == 120
+    assert received[0].output_tokens == 80
+    assert monitor._session_worker is None, "reference must be released when done"
+    assert monitor._session_thread is None
+
+
+def test_monitor_refuses_to_stack_concurrent_scans(qt_app, session_file: Path) -> None:
+    cfg = Config()
+    cfg.parser.projects_dir = str(session_file.parents[1])
+    cfg.parser.auto_discover_wsl = False
+
+    monitor = UsageMonitor(cfg)
+    monitor.refresh_session()
+    first = monitor._session_thread
+    monitor.refresh_session()
+    assert monitor._session_thread is first, "a second scan must not start while one runs"
+    monitor.shutdown()
+
+
+def test_monitor_shutdown_is_idempotent_and_silences_signals(qt_app) -> None:
+    cfg = Config()
+    cfg.parser.auto_discover_wsl = False
+    monitor = UsageMonitor(cfg)
+    monitor.shutdown()
+    monitor.shutdown()
+
+    received, _ = _pump(monitor, monitor.session_ready, timeout_ms=1)
+    monitor.refresh_session()
+    assert monitor._session_thread is None, "no work may start after shutdown"
+    assert received == []
+
+
+def test_shutdown_joins_a_scan_that_is_still_running(qt_app, session_file: Path) -> None:
+    """The application's exit path.
+
+    Qt aborts the whole process if a QThread is destroyed while still running,
+    so shutdown() has to actually join. This test starts a scan and tears the
+    monitor down immediately, without pumping an event loop in between.
+    """
+    cfg = Config()
+    cfg.parser.projects_dir = str(session_file.parents[1])
+    cfg.parser.auto_discover_wsl = False
+
+    monitor = UsageMonitor(cfg)
+    monitor.refresh_session()
+    assert monitor._session_thread is not None
+
+    monitor.shutdown()
+    assert monitor._session_thread is None
+    assert monitor._session_worker is None
+    del monitor  # must not abort the interpreter

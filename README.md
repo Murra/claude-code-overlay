@@ -40,6 +40,7 @@ you without leaving your editor or typing `/status`.
 |---|---|
 | **Live local counts** | Reads `~/.claude/projects/**/*.jsonl` every 2 seconds. Input, output and both cache counters, de-duplicated by request ID. |
 | **Plan limits** | Best-effort `claude` CLI probe on a worker thread with a hard 5-second timeout, cached to disk between runs. |
+| **Finds WSL sessions** | Runs Claude Code inside WSL? The Windows overlay auto-discovers `\\wsl.localhost\<distro>\home\<user>\.claude` and merges it in. |
 | **Always visible, never in the way** | `Tool` window flag keeps it off the taskbar and out of Alt-Tab. Stays on top until you toggle it off. |
 | **Drag anywhere** | Anchored bottom-left by default; drag it somewhere else and the position sticks. |
 | **Threshold colours** | Green under 60%, amber under 85%, red above. All three thresholds are configurable. |
@@ -64,20 +65,27 @@ Get-FileHash .\ClaudeCodeOverlay.exe -Algorithm SHA256
 
 ### Run from source
 
-```bash
+This is a Windows desktop application, so run it with **Windows Python** — from PowerShell or
+Command Prompt, not from inside a WSL shell:
+
+```powershell
 git clone https://github.com/USERNAME/claude-code-overlay.git
 cd claude-code-overlay
 
-python -m venv .venv
-.venv\Scripts\activate          # Windows
-# source .venv/bin/activate     # macOS / Linux
+py -3 -m venv .venv
+.venv\Scripts\activate
 
 pip install -r requirements.txt
-python src/main.py
+python src\main.py
 ```
 
-Python 3.10 or newer. PyQt6 ships prebuilt wheels for every supported platform, so there is
-nothing to compile.
+Python 3.10–3.14. PyQt6 ships prebuilt wheels for all of them, so nothing is compiled.
+
+> **Running `pip install` inside WSL will fail**, with `sipbuild` trying to build PyQt6 from
+> source and asking for `qmake`. That is WSL's Linux Python picking up a Linux source
+> distribution; it has nothing to do with the overlay. Use Windows Python. If your Claude Code
+> sessions run inside WSL, that is fine and fully supported — see
+> [Using it with WSL](#using-it-with-wsl) below.
 
 ### Command-line flags
 
@@ -103,6 +111,44 @@ nothing to compile.
 **Count Cache Tokens** is off by default. Prompt-cache reads are billed at a fraction of
 normal input tokens, so including them in the headline number makes a long session look far
 more expensive than it is. The raw cache figures are always in the tooltip.
+
+## Using it with WSL
+
+A very common setup is Claude Code running inside WSL while the desktop is Windows. The logs
+then live in the WSL filesystem, not in your Windows user profile, so
+`C:\Users\<you>\.claude\projects` is empty or absent and a naive reader finds nothing.
+
+The overlay handles this automatically. On startup — and every few minutes after — it asks
+`wsl.exe` which distributions are **running**, then scans each one's
+`\\wsl.localhost\<distro>\home\<user>\.claude\projects`. Anything it finds is merged with the
+Windows profile directory, and the newest transcript across all of them wins.
+
+```
+discovered transcript directories:
+    C:\Users\you\.claude\projects                        (if it exists)
+    \\wsl.localhost\Ubuntu\home\you\.claude\projects     (auto-discovered)
+```
+
+Two deliberate choices worth knowing about:
+
+- **Only running distributions are probed.** Touching `\\wsl.localhost\<distro>` *boots* a
+  stopped distribution, and a desktop widget has no business starting a VM to look for files
+  nobody is writing. A distro with a live Claude Code session is running by definition.
+- **Discovery is cached** for `discovery_ttl_s` (5 minutes), but retries every 15 seconds while
+  nothing has been found — so starting WSL after the overlay does not leave it blank for long.
+
+Scanning over the WSL UNC path costs roughly 130 ms per poll on a typical history, which is
+comfortably inside the 2-second interval. If you would rather point at it explicitly, or you
+use a distro layout the probe misses, set the path by hand:
+
+```jsonc
+{
+  "parser": {
+    "extra_projects_dirs": ["\\\\wsl.localhost\\Ubuntu\\home\\you\\.claude\\projects"],
+    "auto_discover_wsl": false
+  }
+}
+```
 
 ## Configuration
 
@@ -145,7 +191,11 @@ than fatal — so it is safe to edit by hand.
     "latest_session_only": true,   // false sums every session from the last hour
     "session_window_s": 3600,
     "context_window_tokens": 200000,
-    "cli_enabled": true
+    "cli_enabled": true,
+    "max_session_candidates": 8,   // how far back to look for a session with real usage
+    "auto_discover_wsl": true,     // find Claude Code logs inside running WSL distros
+    "extra_projects_dirs": [],     // additional transcript directories to merge in
+    "discovery_ttl_s": 300
   }
 }
 ```
@@ -156,16 +206,18 @@ Set `CLAUDE_CONFIG_DIR` to point the parser at a Claude Code state directory oth
 ## Architecture
 
 ```
-                 ┌──────────────────────────────┐
-                 │  ~/.claude/projects/          │
-                 │    <project-slug>/            │
-                 │      <session-uuid>.jsonl     │
-                 └──────────────┬───────────────┘
-                                │  read-only, every 2s
+       ┌──────────────────────────────┐   ┌────────────────────────────────┐
+       │ C:\Users\<you>\.claude\        │   │ \\wsl.localhost\<distro>\home\  │
+       │   projects\<slug>\*.jsonl      │   │   <you>\.claude\projects\*.jsonl│
+       └──────────────┬───────────────┘   └───────────────┬────────────────┘
+                      │                                    │
+                      └──────────┬─────────────────────────┘
+                                 │  parser.resolve_projects_dirs()
+                                 │  read-only, every 2s
                  ┌──────────────▼───────────────┐        ┌────────────────────┐
                  │  parser.SessionScanWorker     │        │ parser.CliProbe-   │
-                 │  • newest file by mtime       │        │ Worker             │
-                 │  • json.loads per line        │        │ • claude -p /status│
+                 │  • newest file *with usage*   │        │ Worker             │
+                 │  • json.loads per line        │        │ • claude -p /usage │
                  │  • skip malformed lines       │        │ • 5s timeout       │
                  │  • de-dup by requestId        │        │ • disk cache       │
                  └──────────────┬───────────────┘        └─────────┬──────────┘
@@ -221,14 +273,41 @@ Three details make the difference between a number you can trust and one you can
 
 ### About the plan-limit readout
 
-`/status` and `/usage` are *interactive* slash commands inside a Claude Code session — there is
-no stable non-interactive command that prints your weekly quota. The CLI probe tries
-`claude -p /status`, then `claude -p /usage`, scrapes any percentage it recognises, and caches
-the result in `~/.claude-code-overlay/cache.json`.
+There is no documented API for your plan quota, so the overlay shells out to the CLI. As of
+September 2026, `claude -p /usage` answers with:
 
-If neither works on your setup, the badge shows `--` and falls back to a local context-window
-estimate. **Local token counting is unaffected** — it never touches the CLI. Set
-`parser.cli_enabled` to `false` to skip the probe entirely.
+```
+You are currently using your subscription to power your Claude Code usage
+
+Current session: 17% used · resets Sep 13, 10:20pm (America/New_York)
+Current week (all models): 24% used · resets Sep 19, 12pm (America/New_York)
+```
+
+The probe scrapes those percentages, prefers the weekly figure for the badge, pairs it with the
+matching reset time, and caches the result in `~/.claude-code-overlay/cache.json`. That cache is
+what gets displayed when a later probe fails, so the badge does not flicker back to `--` after
+one bad run.
+
+Two things worth knowing, both learned the hard way:
+
+- **`/usage` is tried first, `/status` second.** `claude -p /status` replies "/status isn't
+  available in this environment", and takes ~2.5 s to say so. Probing it first doubled the
+  round trip for nothing. It is kept only as a fallback in case that reverses.
+- **Each probe writes a session transcript of its own.** `claude -p` starts a real session, so
+  it leaves a `.jsonl` behind in your *Windows* profile containing no assistant turns. Those
+  files are always the newest on disk, so a naive "newest file wins" rule locks the overlay onto
+  an empty transcript and reports **0 tokens forever**. The parser therefore walks newest-first
+  and takes the first transcript that actually recorded usage, bounded by
+  `parser.max_session_candidates`.
+
+Because the output format is not a stable contract, `tests/test_parser.py` pins the verbatim
+text above — if the wording changes upstream, a test fails rather than the badge quietly going
+blank.
+
+If the probe finds nothing, the badge shows `--` and the bar falls back to a local
+context-window estimate. **Local token counting is unaffected** — it never touches the CLI. Set
+`parser.cli_enabled` to `false` to skip the probe entirely, which also stops it creating those
+transcripts.
 
 ## Building the executable
 
@@ -294,10 +373,13 @@ with nothing but the standard library, so you can change the colours and re-run 
 
 | Symptom | Cause and fix |
 |---|---|
-| Shows `No ~/.claude logs` | Claude Code has not run on this machine, or your state directory is elsewhere. Set `CLAUDE_CONFIG_DIR`. |
+| Shows `No ~/.claude logs` | Claude Code has not run on this machine, or your state directory is elsewhere. Set `CLAUDE_CONFIG_DIR`, or add the path to `parser.extra_projects_dirs`. |
+| Empty while Claude Code runs in WSL | The distro must be running for auto-discovery to see it. Check `wsl -l --running`, then run with `--verbose` and look for "Discovered WSL transcript directories" in the log. |
+| `sipbuild` / `qmake` error from `pip install` | You are installing with WSL's Linux Python. Use Windows Python — see [Run from source](#run-from-source). |
 | Shows `No sessions yet` | The directory exists but holds no transcripts. Start a Claude Code session. |
 | Percentage stays `--` | The CLI probe found nothing parseable. Expected on many setups — local counts still work. |
 | Counter looks too high | Turn off **Count Cache Tokens** in the right-click menu. |
+| Counter stuck at `0 tokens` | An empty transcript is shadowing the real one. Raise `parser.max_session_candidates`, or set `parser.cli_enabled` to `false` so the probe stops creating them. |
 | Overlay is off-screen after a monitor change | Right-click → **Reset Position**, or run with `--reset-position`. |
 | Nothing appears at all | Check `~/.claude-code-overlay/overlay.log`, or run `python src/main.py --verbose`. |
 | Hidden behind a fullscreen game | Exclusive-fullscreen apps bypass every always-on-top window. Use borderless windowed mode. |

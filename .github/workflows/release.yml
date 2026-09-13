@@ -23,18 +23,25 @@ env:
 
 jobs:
   test:
-    name: Tests (${{ matrix.os }})
+    name: Tests (${{ matrix.os }}, py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # The oldest and newest supported interpreters are both covered on
+      # Windows: dependency ranges that resolve on one can fail to resolve on
+      # the other, which is exactly how a bad pin ships unnoticed.
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        include:
+          - { os: windows-latest, python: "3.10" }
+          - { os: windows-latest, python: "3.12" }
+          - { os: windows-latest, python: "3.14" }
+          - { os: ubuntu-latest, python: "3.12" }
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version: ${{ matrix.python }}
           cache: pip
 
       - name: Install dependencies
@@ -48,6 +55,10 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: python -m pytest tests -q
+
+      - name: Check for syntax warnings
+        run: |
+          python -W error -c "import compileall, sys; sys.exit(0 if compileall.compile_dir('src', quiet=1) and compileall.compile_file('build.py', quiet=1) else 1)"
 
   build:
     name: Build Windows executable

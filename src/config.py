@@ -116,6 +116,18 @@ class ParserConfig:
     #: Directory holding per-project session transcripts.
     projects_dir: str = str(CLAUDE_HOME / "projects")
 
+    #: Additional transcript directories to scan, merged with the one above.
+    extra_projects_dirs: List[str] = field(default_factory=list)
+
+    #: On Windows, also scan ``\\wsl.localhost\<distro>\home\<user>\.claude``.
+    #: Claude Code running inside WSL writes its logs there, not to the Windows
+    #: user profile, so without this a Windows overlay finds nothing.
+    auto_discover_wsl: bool = True
+
+    #: How long a successful directory discovery is reused, in seconds.
+    #: Discovery is retried far sooner while nothing has been found.
+    discovery_ttl_s: int = 300
+
     #: Count cache reads/writes towards the session total.  Cache reads are
     #: billed at a fraction of the input price, so this is off by default and
     #: the raw numbers are still exposed in the tooltip.
@@ -126,16 +138,24 @@ class ParserConfig:
     latest_session_only: bool = True
     session_window_s: int = 3_600
 
+    #: How many recent transcripts to look at before giving up on finding one
+    #: that contains actual token usage.  Sessions that record no assistant
+    #: turns are skipped: the CLI probe below creates one such transcript every
+    #: time it runs, and those would otherwise mask the real session forever.
+    max_session_candidates: int = 8
+
     #: Approximate context budget used for the local percentage readout.
     context_window_tokens: int = 200_000
 
     #: Candidate CLI invocations, tried in order until one yields a percentage.
-    #: ``/status`` and ``/usage`` are interactive slash commands, so this is a
-    #: best-effort probe: failure is expected and handled, never fatal.
+    #: ``/usage`` is first because it is the one that actually reports quota:
+    #: ``claude -p /status`` replies "/status isn't available in this
+    #: environment" and burns ~2.5s doing it. ``/status`` is kept as a fallback
+    #: in case a future release reverses that.
     cli_commands: List[List[str]] = field(
         default_factory=lambda: [
-            ["claude", "-p", "/status"],
             ["claude", "-p", "/usage"],
+            ["claude", "-p", "/status"],
         ]
     )
     cli_enabled: bool = True

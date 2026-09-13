@@ -22,6 +22,7 @@ reaches the event loop.
 from __future__ import annotations
 
 import json
+import locale
 import logging
 import os
 import re
@@ -29,7 +30,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
@@ -40,8 +41,11 @@ log = logging.getLogger(__name__)
 #: Strips ANSI SGR/CSI sequences from CLI output before regexing it.
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
-#: ``Weekly limit: 42% used`` / ``Session 12.5% (resets 3pm)`` and friends.
+#: ``Current week (all models): 24% used`` and friends.
 PERCENT_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%")
+
+#: Trailing ``resets Sep 19, 12pm (America/New_York)`` on a usage line.
+RESET_RE = re.compile(r"resets?\s+(?:at\s+|in\s+|on\s+)?(.+?)\s*$", re.IGNORECASE)
 
 _WEEKLY_HINTS = ("week", "7-day", "seven day")
 _SESSION_HINTS = ("session", "5-hour", "five hour", "current block")
@@ -162,17 +166,144 @@ class LimitUsage:
 # --------------------------------------------------------------------------- #
 
 
-def iter_session_files(projects_dir: Path) -> List[Path]:
-    """Return every ``.jsonl`` transcript under ``projects_dir``, newest first.
+def _decode_console(raw: bytes) -> str:
+    """Decode Windows console output, which ``wsl.exe`` emits as UTF-16-LE."""
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff") or (len(raw) > 1 and raw[1:2] == b"\x00"):
+        try:
+            return raw.decode("utf-16-le", errors="replace")
+        except ValueError:
+            pass
+    return raw.decode("utf-8", errors="replace")
 
-    Uses ``os.scandir`` so a directory that disappears mid-walk (Claude Code
-    rotates these) is skipped rather than raising.
+
+def list_wsl_distros(timeout_s: float = 5.0) -> List[str]:
+    r"""Names of *running* WSL distributions.
+
+    Deliberately ``--running`` rather than every installed distro: touching
+    ``\\wsl.localhost\<distro>`` boots a stopped distribution, and spinning up a
+    VM to look for log files nobody is writing would be a rude thing for a
+    desktop widget to do.  A distro with an active Claude Code session is
+    running by definition.
     """
-    results: List[Tuple[float, Path]] = []
-    if not projects_dir.is_dir():
+    if os.name != "nt":
+        return []
+    try:
+        completed = subprocess.run(
+            ["wsl.exe", "--list", "--quiet", "--running"],
+            capture_output=True,
+            timeout=timeout_s,
+            creationflags=_subprocess_flags(),
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.debug("Could not list WSL distros: %s", exc)
+        return []
+    if completed.returncode != 0:
         return []
 
-    stack: List[Path] = [projects_dir]
+    text = _decode_console(completed.stdout or b"").replace("\x00", "")
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def discover_wsl_projects_dirs(timeout_s: float = 5.0) -> List[Path]:
+    """Find ``.claude/projects`` inside every running WSL distribution."""
+    found: List[Path] = []
+    for distro in list_wsl_distros(timeout_s):
+        root = Path(f"\\\\wsl.localhost\\{distro}")
+        candidates: List[Path] = []
+        try:
+            home = root / "home"
+            if home.is_dir():
+                candidates.extend(entry / ".claude" / "projects" for entry in home.iterdir())
+        except OSError as exc:
+            log.debug("Could not enumerate %s: %s", root, exc)
+        candidates.append(root / "root" / ".claude" / "projects")
+
+        for candidate in candidates:
+            try:
+                if candidate.is_dir():
+                    found.append(candidate)
+            except OSError:
+                continue
+    if found:
+        log.info("Discovered WSL transcript directories: %s", ", ".join(map(str, found)))
+    return found
+
+
+#: ``(key, paths, timestamp)`` — discovery is comparatively expensive, so it is
+#: cached between polls rather than repeated every two seconds.  The key is
+#: derived from the settings that feed discovery, so editing the config (or a
+#: test pointing at a different directory) invalidates it immediately.
+_dir_cache: Tuple[Optional[tuple], List[Path], float] = (None, [], 0.0)
+
+
+def _discovery_key(cfg: ParserConfig) -> tuple:
+    return (cfg.projects_dir, tuple(cfg.extra_projects_dirs), cfg.auto_discover_wsl)
+
+
+def reset_discovery_cache() -> None:
+    """Force the next :func:`resolve_projects_dirs` call to re-scan."""
+    global _dir_cache
+    _dir_cache = (None, [], 0.0)
+
+
+def resolve_projects_dirs(cfg: ParserConfig, timeout_s: float = 5.0) -> List[Path]:
+    """Every transcript directory worth scanning, newest discovery cached.
+
+    Order: the configured directory, any explicit extras, then WSL. The retry
+    interval collapses to 15s while nothing has been found, so starting WSL
+    after the overlay does not leave it blank for the full TTL.
+    """
+    global _dir_cache
+
+    key = _discovery_key(cfg)
+    cached_key, cached, stamp = _dir_cache
+    if cached_key == key and stamp:
+        ttl = max(15, cfg.discovery_ttl_s) if cached else 15
+        if (time.time() - stamp) < ttl:
+            return cached
+
+    dirs: List[Path] = []
+
+    def add(path: Path) -> None:
+        try:
+            if path.is_dir() and path not in dirs:
+                dirs.append(path)
+        except OSError:
+            pass
+
+    add(Path(cfg.projects_dir).expanduser())
+    for extra in cfg.extra_projects_dirs:
+        add(Path(extra).expanduser())
+    if cfg.auto_discover_wsl:
+        for path in discover_wsl_projects_dirs(timeout_s):
+            add(path)
+
+    _dir_cache = (key, dirs, time.time())
+    return dirs
+
+
+def iter_session_files(projects_dir: "Path | Iterable[Path]") -> List[Path]:
+    """Return every ``.jsonl`` transcript under the given root(s), newest first.
+
+    Accepts a single directory or several, so a Windows overlay can merge its
+    own profile with one or more WSL homes.  Uses ``os.scandir`` so a directory
+    that disappears mid-walk (Claude Code rotates these) is skipped rather than
+    raising.
+    """
+    roots = [projects_dir] if isinstance(projects_dir, Path) else list(projects_dir)
+    results: List[Tuple[float, Path]] = []
+
+    stack: List[Path] = []
+    for root in roots:
+        try:
+            if root.is_dir():
+                stack.append(root)
+        except OSError:
+            continue
+    if not stack:
+        return []
+
     while stack:
         current = stack.pop()
         try:
@@ -326,18 +457,50 @@ def parse_session_file(
     return usage
 
 
+def _newest_session_with_usage(
+    files: List[Path], cfg: ParserConfig, polling: PollingConfig
+) -> SessionUsage:
+    """Newest transcript that actually recorded token usage.
+
+    "Newest file wins" is not quite right, because not every transcript
+    contains a conversation.  ``claude -p /usage`` -- the CLI probe this very
+    module runs to read plan limits -- writes a fresh transcript every time it
+    is invoked, and those contain no assistant turns at all.  They are always
+    the newest file on disk, so a naive newest-file rule locks the overlay onto
+    an empty session and reports zero tokens indefinitely, while the user's real
+    session sits one slot further down the list.
+
+    So: walk newest-first and take the first transcript with at least one usage
+    record, keeping the newest readable one as a fallback.
+    """
+    fallback: Optional[SessionUsage] = None
+    limit = max(1, cfg.max_session_candidates)
+
+    for path in files[:limit]:
+        usage = parse_session_file(path, polling.max_lines_per_file)
+        if usage.ok and usage.messages > 0:
+            return usage
+        if fallback is None and usage.ok:
+            fallback = usage
+
+    if fallback is not None:
+        fallback.status = "No usage yet"
+        return fallback
+    return parse_session_file(files[0], polling.max_lines_per_file)
+
+
 def collect_session_usage(cfg: ParserConfig, polling: PollingConfig) -> SessionUsage:
     """Top-level local scan honouring the ``latest_session_only`` setting."""
-    projects_dir = Path(cfg.projects_dir).expanduser()
-    if not projects_dir.is_dir():
+    projects_dirs = resolve_projects_dirs(cfg, polling.cli_timeout_s)
+    if not projects_dirs:
         return SessionUsage(status="No ~/.claude logs", ok=False)
 
-    files = iter_session_files(projects_dir)
+    files = iter_session_files(projects_dirs)
     if not files:
         return SessionUsage(status="No sessions yet", ok=False)
 
     if cfg.latest_session_only:
-        return parse_session_file(files[0], polling.max_lines_per_file)
+        return _newest_session_with_usage(files, cfg, polling)
 
     cutoff = time.time() - max(1, cfg.session_window_s)
     seen: set = set()
@@ -388,6 +551,8 @@ def parse_limit_output(text: str) -> LimitUsage:
         return result
 
     clean = ANSI_RE.sub("", text)
+    weekly_reset = ""
+    session_reset = ""
     for raw_line in clean.splitlines():
         line = raw_line.strip()
         if not line:
@@ -402,18 +567,24 @@ def parse_limit_output(text: str) -> LimitUsage:
         if not 0.0 <= percent <= 100.0:
             continue
 
+        # Read the reset stamp off the same line, in its original case, so it
+        # stays legible ("Sep 19, 12pm (America/New_York)").
+        reset_match = RESET_RE.search(line)
+        reset = reset_match.group(1).strip(" .")[:48] if reset_match else ""
+
         lowered = line.lower()
         if any(hint in lowered for hint in _OPUS_HINTS) and result.opus_percent is None:
             result.opus_percent = percent
         elif any(hint in lowered for hint in _WEEKLY_HINTS) and result.weekly_percent is None:
             result.weekly_percent = percent
+            weekly_reset = weekly_reset or reset
         elif any(hint in lowered for hint in _SESSION_HINTS) and result.session_percent is None:
             result.session_percent = percent
+            session_reset = session_reset or reset
 
-        if "reset" in lowered and not result.resets_at:
-            reset = re.search(r"reset[a-z]*\s*(?:at|in|on)?\s*[:\-]?\s*(.+)", lowered)
-            if reset:
-                result.resets_at = reset.group(1).strip(" .)").title()[:40]
+    # The badge shows the weekly figure when there is one, so pair it with the
+    # matching reset time rather than whichever line happened to come first.
+    result.resets_at = weekly_reset or session_reset
 
     if (
         result.weekly_percent is None
@@ -427,6 +598,26 @@ def parse_limit_output(text: str) -> LimitUsage:
     result.status = "ok"
     result.checked_at = time.time()
     return result
+
+
+def _decode_output(raw: Optional[bytes]) -> str:
+    """Decode CLI output without mangling it.
+
+    The Claude CLI separates fields with U+00B7, and on Windows the bytes are
+    not reliably UTF-8 — decoding with a fixed codec turns that into a
+    replacement character and corrupts the reset timestamp alongside it. Try
+    UTF-8 first, then the console's own encoding, then give up gracefully.
+    """
+    if not raw:
+        return ""
+    for encoding in ("utf-8", locale.getpreferredencoding(False), "cp1252"):
+        if not encoding:
+            continue
+        try:
+            return raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", errors="replace")
 
 
 def _subprocess_flags() -> int:
@@ -447,9 +638,6 @@ def run_cli_probe(cfg: ParserConfig, timeout_s: float) -> LimitUsage:
             completed = subprocess.run(
                 list(command),
                 capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
                 timeout=timeout_s,
                 creationflags=_subprocess_flags(),
                 stdin=subprocess.DEVNULL,
@@ -468,7 +656,8 @@ def run_cli_probe(cfg: ParserConfig, timeout_s: float) -> LimitUsage:
             last_status = "CLI error"
             continue
 
-        parsed = parse_limit_output((completed.stdout or "") + "\n" + (completed.stderr or ""))
+        merged = _decode_output(completed.stdout) + "\n" + _decode_output(completed.stderr)
+        parsed = parse_limit_output(merged)
         if parsed.ok:
             return parsed
         last_status = parsed.status
@@ -568,6 +757,13 @@ class UsageMonitor(QObject):
         self._config = config
         self._session_thread: Optional[QThread] = None
         self._cli_thread: Optional[QThread] = None
+        # The workers are moveToThread'd and therefore cannot have a parent, so
+        # nothing but these attributes keeps them alive. Without them Python
+        # collects the worker the moment the starting method returns, the
+        # started -> run connection dies silently, and the thread sits idle
+        # forever with no error anywhere.
+        self._session_worker: Optional[QObject] = None
+        self._cli_worker: Optional[QObject] = None
         self._closing = False
 
     # -- public API ------------------------------------------------------
@@ -576,7 +772,10 @@ class UsageMonitor(QObject):
         if self._closing or self._session_thread is not None:
             return
         worker = SessionScanWorker(self._config)
-        self._session_thread = self._start(worker, self._on_session_done)
+        self._session_worker = worker
+        self._session_thread = self._start(
+            worker, self._on_session_done, self._on_session_thread_finished
+        )
 
     def refresh_limits(self) -> None:
         if self._closing or self._cli_thread is not None:
@@ -585,44 +784,69 @@ class UsageMonitor(QObject):
             self.limits_ready.emit(load_cached_limits())
             return
         worker = CliProbeWorker(self._config)
-        self._cli_thread = self._start(worker, self._on_limits_done)
+        self._cli_worker = worker
+        self._cli_thread = self._start(
+            worker, self._on_limits_done, self._on_cli_thread_finished
+        )
 
     def refresh_all(self) -> None:
         self.refresh_session()
         self.refresh_limits()
 
     def shutdown(self, wait_ms: int = 2_000) -> None:
-        """Stop accepting work and join any in-flight threads."""
+        """Stop accepting work and join any in-flight threads.
+
+        Must genuinely join them: Qt aborts the process if a QThread is
+        destroyed while still running, which is what happens on exit if a scan
+        is in flight.  Safe to call more than once.
+        """
         self._closing = True
         for thread in (self._session_thread, self._cli_thread):
             if thread is None:
                 continue
-            thread.quit()
-            if not thread.wait(wait_ms):
-                log.debug("Worker thread did not stop within %dms", wait_ms)
+            try:
+                thread.quit()
+                if not thread.wait(wait_ms):
+                    log.warning("Worker thread did not stop within %dms", wait_ms)
+            except RuntimeError:
+                # The underlying C++ object was already deleted by Qt.
+                pass
         self._session_thread = None
         self._cli_thread = None
+        self._session_worker = None
+        self._cli_worker = None
 
     # -- internals -------------------------------------------------------
 
-    def _start(self, worker: QObject, callback) -> QThread:
+    def _start(self, worker: QObject, callback, on_thread_finished) -> QThread:
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(callback)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
+        # Our references are released on QThread.finished, not on the worker's
+        # own signal. The worker finishes first; the thread is still running
+        # its event loop at that point, and dropping the reference early leaves
+        # shutdown() with nothing to join.
+        thread.finished.connect(on_thread_finished)
         thread.finished.connect(thread.deleteLater)
         thread.start()
         return thread
 
-    def _on_session_done(self, usage: SessionUsage) -> None:
+    def _on_session_thread_finished(self) -> None:
         self._session_thread = None
+        self._session_worker = None
+
+    def _on_cli_thread_finished(self) -> None:
+        self._cli_thread = None
+        self._cli_worker = None
+
+    def _on_session_done(self, usage: SessionUsage) -> None:
         if not self._closing:
             self.session_ready.emit(usage)
 
     def _on_limits_done(self, limits: LimitUsage) -> None:
-        self._cli_thread = None
         if not self._closing:
             self.limits_ready.emit(limits)
 
