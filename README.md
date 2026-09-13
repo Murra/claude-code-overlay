@@ -9,7 +9,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg?style=flat-square)](https://www.python.org/downloads/)
 [![Build](https://img.shields.io/github/actions/workflow/status/Murra/claude-code-overlay/release.yml?style=flat-square)](../../actions)
 
-<img src="docs/screenshot.png" alt="The overlay sitting in the bottom-left of the Windows 11 taskbar, showing session usage at 34% with 2h 59m until reset and weekly usage at 62% with 5d 16h until reset" width="760">
+<img src="docs/screenshot.png" alt="The overlay running in a real Windows 11 taskbar, magnified below: session usage at 87% in red with 2h 52m until reset, weekly usage at 32% in green with 5d 16h until reset" width="860">
 
 </div>
 
