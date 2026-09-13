@@ -1,0 +1,157 @@
+name: Release
+
+# Tag-driven: pushing `v1.0.0` builds the Windows binary and publishes a
+# GitHub Release with it attached. `workflow_dispatch` runs the same build
+# without publishing, which is handy for checking a change before tagging.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build the exe but do not create a release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: "3.12"
+  APP_NAME: ClaudeCodeOverlay
+
+jobs:
+  test:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # PyQt6 needs an X server to import some modules on Linux runners; the
+      # offscreen platform plugin keeps the headless test run honest.
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest tests -q
+
+  build:
+    name: Build Windows executable
+    needs: test
+    runs-on: windows-latest
+    outputs:
+      sha256: ${{ steps.hash.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Regenerate icon
+        run: python assets/make_icon.py
+
+      - name: Build single-file executable
+        run: python build.py --clean
+
+      - name: Verify the executable exists
+        shell: pwsh
+        run: |
+          $exe = "dist/$env:APP_NAME.exe"
+          if (-not (Test-Path $exe)) { throw "missing $exe" }
+          $size = [math]::Round((Get-Item $exe).Length / 1MB, 1)
+          Write-Host "Built $exe ($size MB)"
+
+      - name: Compute SHA-256
+        id: hash
+        shell: pwsh
+        run: |
+          $exe = "dist/$env:APP_NAME.exe"
+          $sum = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          "$sum  $env:APP_NAME.exe" | Out-File -Encoding ascii "dist/$env:APP_NAME.exe.sha256"
+          "sha256=$sum" >> $env:GITHUB_OUTPUT
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClaudeCodeOverlay-windows
+          path: |
+            dist/ClaudeCodeOverlay.exe
+            dist/ClaudeCodeOverlay.exe.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ClaudeCodeOverlay-windows
+          path: dist
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Claude Code Overlay ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') }}
+          generate_release_notes: true
+          files: |
+            dist/ClaudeCodeOverlay.exe
+            dist/ClaudeCodeOverlay.exe.sha256
+          body: |
+            ## Claude Code Overlay ${{ github.ref_name }}
+
+            A frameless, always-on-top desktop widget showing live Claude Code
+            token usage, read straight from your local `~/.claude/` logs.
+
+            ### Install
+
+            1. Download **ClaudeCodeOverlay.exe** below.
+            2. Run it. No installer, no admin rights, nothing to configure.
+            3. The overlay docks to the bottom-left of your screen — drag it
+               anywhere, right-click for the menu, or use the tray icon.
+
+            Windows SmartScreen will warn about an unsigned binary the first
+            time: choose **More info → Run anyway**, or verify the hash first.
+
+            ```
+            SHA-256: ${{ needs.build.outputs.sha256 }}
+            ```
+
+            Verify it yourself in PowerShell:
+
+            ```powershell
+            Get-FileHash .\ClaudeCodeOverlay.exe -Algorithm SHA256
+            ```
+
+            ### Requirements
+
+            Windows 10/11 (x64). Claude Code is only needed for the plan-limit
+            readout; local token counting works from the log files alone.

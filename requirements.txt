@@ -1,0 +1,10 @@
+# Runtime
+PyQt6==6.7.1
+PyQt6-Qt6==6.7.3
+PyQt6-sip==13.8.0
+
+# Packaging
+pyinstaller==6.11.1
+
+# Development / CI
+pytest==8.3.4
