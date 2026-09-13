@@ -350,11 +350,35 @@ def test_headline_tracks_whichever_limit_is_closest_to_biting() -> None:
     assert LimitUsage().headline_percent is None
 
 
+@pytest.fixture()
+def new_york_clock():
+    """Pin the process timezone so stamps carrying a zone are deterministic.
+
+    Without this the expectations below only hold on a machine whose local zone
+    happens to be America/New_York — which is exactly the assumption that made
+    these tests pass locally and fail on a UTC CI runner.
+    """
+    import os
+    import time as time_module
+
+    if not hasattr(time_module, "tzset"):
+        pytest.skip("pinning TZ requires tzset, which Windows does not provide")
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = "America/New_York"
+    time_module.tzset()
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time_module.tzset()
+
+
 @pytest.mark.parametrize(
     "stamp, expected",
     [
-        ("Sep 19, 12pm (America/New_York)", "5d 18h"),
-        ("Sep 13, 10:20pm (America/New_York)", "4h 25m"),
         ("Sep 13, 10:20pm", "4h 25m"),
         ("10:20pm", "4h 25m"),
         ("Sep 13, 6:00pm", "5m"),
@@ -362,12 +386,49 @@ def test_headline_tracks_whichever_limit_is_closest_to_biting() -> None:
         ("Jan 2, 9am", "110d 15h"),
     ],
 )
-def test_format_countdown(stamp: str, expected: str) -> None:
+def test_format_countdown_without_a_zone(stamp: str, expected: str) -> None:
+    """A stamp with no zone is local time, so this holds on any machine."""
     from datetime import datetime
 
     from parser import format_countdown
 
     assert format_countdown(stamp, datetime(2026, 9, 13, 17, 55)) == expected
+
+
+@pytest.mark.parametrize(
+    "stamp, expected",
+    [
+        ("Sep 19, 12pm (America/New_York)", "5d 18h"),
+        ("Sep 13, 10:20pm (America/New_York)", "4h 25m"),
+    ],
+)
+def test_format_countdown_with_a_zone(new_york_clock, stamp: str, expected: str) -> None:
+    from datetime import datetime
+
+    from parser import format_countdown
+
+    assert format_countdown(stamp, datetime(2026, 9, 13, 17, 55)) == expected
+
+
+def test_zoned_stamp_is_converted_not_ignored(new_york_clock) -> None:
+    """The zone in the stamp must actually be applied.
+
+    Same wall-clock time in two zones must produce countdowns three hours
+    apart, which is what a naive implementation that drops the zone gets wrong.
+    Skipped when zoneinfo has no database to resolve the names against.
+    """
+    from datetime import datetime
+
+    from parser import parse_reset_stamp
+
+    now = datetime(2026, 9, 13, 17, 55)
+    eastern = parse_reset_stamp("Sep 13, 10:20pm (America/New_York)", now)
+    pacific = parse_reset_stamp("Sep 13, 10:20pm (America/Los_Angeles)", now)
+    if eastern is None or pacific is None:
+        pytest.skip("no tz database available")
+    if eastern == pacific:
+        pytest.skip("zoneinfo could not resolve the zone names on this platform")
+    assert (pacific - eastern).total_seconds() == 3 * 3600
 
 
 def test_countdown_degrades_to_the_raw_text() -> None:
