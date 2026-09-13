@@ -4,10 +4,10 @@
 
 **A frameless desktop widget that sits in your Windows 11 taskbar and shows how much of your Claude Code plan you have left.**
 
-[![Release](https://img.shields.io/github/v/release/USERNAME/claude-code-overlay?style=flat-square)](https://github.com/USERNAME/claude-code-overlay/releases/latest)
+[![Release](https://img.shields.io/github/v/release/Murra/claude-code-overlay?style=flat-square)](https://github.com/Murra/claude-code-overlay/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg?style=flat-square)](https://www.python.org/downloads/)
-[![Build](https://img.shields.io/github/actions/workflow/status/USERNAME/claude-code-overlay/release.yml?style=flat-square)](../../actions)
+[![Build](https://img.shields.io/github/actions/workflow/status/Murra/claude-code-overlay/release.yml?style=flat-square)](../../actions)
 
 <!-- Replace with a real capture: 220x65 overlay in the bottom-left corner while a Claude Code session runs. -->
 <img src="docs/demo.gif" alt="Claude Code Overlay running in the bottom-left corner of a Windows 11 desktop" width="640">
@@ -76,7 +76,7 @@ This is a Windows desktop application, so run it with **Windows Python** — fro
 Command Prompt, not from inside a WSL shell:
 
 ```powershell
-git clone https://github.com/USERNAME/claude-code-overlay.git
+git clone https://github.com/Murra/claude-code-overlay.git
 cd claude-code-overlay
 
 py -3 -m venv .venv
