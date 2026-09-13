@@ -46,6 +46,7 @@ cache breakdown belongs.
 | **Reset countdowns** | `4h 12m`, `5d 17h` — parsed from the CLI's absolute stamps, because "how long have I got" beats "Sep 19, 12pm". |
 | **Fits the taskbar** | 262x40, anchored bottom-left over the taskbar, DPI-correct on mixed-scaling multi-monitor setups. One click parks it just above instead. |
 | **Token detail on hover** | Input, output and both cache counters, de-duplicated by request ID, read from `~/.claude/projects/**/*.jsonl`. |
+| **Cleans up after itself** | Each plan-limit probe starts a real session and leaves a transcript. A janitor removes them, so the app does not litter `~/.claude` with ~700 dead files a day. |
 | **Finds WSL sessions** | Runs Claude Code inside WSL? The Windows overlay auto-discovers `\\wsl.localhost\<distro>\home\<user>\.claude` and merges it in. |
 | **Always visible, never in the way** | `Tool` window flag keeps it off the taskbar and out of Alt-Tab. Stays on top until you toggle it off. |
 | **Drag anywhere** | Anchored bottom-left by default; drag it somewhere else and the position sticks. |
@@ -101,6 +102,8 @@ Python 3.10–3.14. PyQt6 ships prebuilt wheels for all of them, so nothing is c
 | `--no-tray` | Skip the tray icon entirely. |
 | `--reset-position` | Ignore the saved position and re-anchor to bottom-left. |
 | `--verbose` | Debug logging to `~/.claude-code-overlay/overlay.log`. |
+| `--clean-probe-logs` | Delete the transcripts CLI probes left behind, then exit. |
+| `--dry-run` | With `--clean-probe-logs`, list what would go without deleting it. |
 | `--version` | Print the version and exit. |
 
 ## Using it
@@ -219,6 +222,8 @@ than fatal — so it is safe to edit by hand.
     "session_window_s": 3600,
     "context_window_tokens": 200000,
     "cli_enabled": true,
+    "cleanup_probe_logs": true,    // delete the transcripts our own probes create
+    "cleanup_min_age_s": 30,       // never touch a transcript younger than this
     "max_session_candidates": 8,   // how far back to look for a session with real usage
     "auto_discover_wsl": true,     // find Claude Code logs inside running WSL distros
     "extra_projects_dirs": [],     // additional transcript directories to merge in
@@ -377,7 +382,7 @@ Two things worth knowing, both learned the hard way:
   files are always the newest on disk, so a naive "newest file wins" rule locks the overlay onto
   an empty transcript and reports **0 tokens forever**. The parser therefore walks newest-first
   and takes the first transcript that actually recorded usage, bounded by
-  `parser.max_session_candidates`.
+  `parser.max_session_candidates`. They are also deleted — see [The janitor](#the-janitor).
 
 Because the output format is not a stable contract, `tests/test_parser.py` pins the verbatim
 text above — if the wording changes upstream, a test fails rather than the badge quietly going
@@ -387,6 +392,39 @@ If the probe finds nothing, the badge shows `--` and the bar falls back to a loc
 context-window estimate. **Local token counting is unaffected** — it never touches the CLI. Set
 `parser.cli_enabled` to `false` to skip the probe entirely, which also stops it creating those
 transcripts.
+
+### The janitor
+
+At one probe every two minutes, the transcripts described above accumulate at roughly 30 files
+an hour — about 700 a day, for files that contain nothing. The janitor removes them.
+
+It runs after every probe, deleting the transcript that probe just created, and sweeps any
+older strays left by previous runs. `--clean-probe-logs` does the same thing on demand, and
+`--clean-probe-logs --dry-run` lists what it would remove without touching anything.
+
+Deleting files under `~/.claude` is the most dangerous thing this program does, so a file must
+clear every one of these to be removed:
+
+| Condition | Why |
+|---|---|
+| Smaller than 64 KB | A real conversation is not a couple of kilobytes. |
+| **No assistant turn anywhere** | Nothing was ever generated in it. This alone disqualifies almost every real transcript. |
+| Older than `cleanup_min_age_s` (30s) | A session being written right now is never a candidate. Explicitly-named files from the probe that just finished are the one exception. |
+| In `parser.projects_dir` only | Discovered WSL directories are never swept. The probe runs locally, so its litter is local. |
+| Matches one of two signatures | Either it contains a slash command this app invokes (`/usage`), or it contains **no user message at all** — a rejected probe leaves only queue and system rows, and nothing a person typed can be in such a file. |
+
+For a genuine session to match, it would have to contain no response and either nothing you
+typed or nothing but `/usage` — in which case there is nothing in it to lose.
+
+Verified against real data on the development machine: of **73 genuine transcripts**, the
+matcher flagged **0**. Of 55 files left by this project's own probing, it flagged all 55.
+`tests/test_parser.py` pins the safety property directly — a transcript with an assistant turn,
+a large file, a different slash command, and a session the user typed into are each asserted to
+survive a sweep.
+
+Set `parser.cleanup_probe_logs` to `false` to disable it, or `parser.cli_enabled` to `false` to
+stop creating the files in the first place.
+
 
 ## Building the executable
 

@@ -191,6 +191,17 @@ class ParserConfig:
     )
     cli_enabled: bool = True
 
+    #: Delete the transcripts the CLI probe leaves behind. Each ``claude -p``
+    #: invocation starts a real session and writes a ~2.4 KB transcript with no
+    #: assistant turns in it; at the default probe interval that is roughly 700
+    #: junk files a day. Only files matching a probe signature are removed, and
+    #: only from ``projects_dir`` — never from a discovered WSL directory.
+    cleanup_probe_logs: bool = True
+
+    #: Leave transcripts younger than this alone during the backlog sweep, so a
+    #: session being written right now is never a candidate.
+    cleanup_min_age_s: float = 30.0
+
 
 @dataclass
 class Config:

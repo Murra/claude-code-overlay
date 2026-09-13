@@ -772,10 +772,46 @@ def _subprocess_flags() -> int:
 
 
 def run_cli_probe(cfg: ParserConfig, timeout_s: float) -> LimitUsage:
-    """Try each configured CLI command until one yields usable percentages."""
+    """Try each configured CLI command until one yields usable percentages.
+
+    Each invocation starts a real Claude Code session and leaves a transcript
+    behind, so the files created while probing are collected and removed once
+    the probe is done.
+    """
     if not cfg.cli_enabled:
         return LimitUsage(status="disabled")
 
+    local_dir = Path(cfg.projects_dir).expanduser()
+    before: set = set()
+    if cfg.cleanup_probe_logs:
+        try:
+            before = set(iter_session_files(local_dir))
+        except OSError:
+            before = set()
+
+    try:
+        return _run_cli_probe_inner(cfg, timeout_s)
+    finally:
+        if cfg.cleanup_probe_logs:
+            _clean_after_probe(cfg, local_dir, before)
+
+
+def _clean_after_probe(cfg: ParserConfig, local_dir: Path, before: set) -> None:
+    """Remove what this probe just created, then chip away at any backlog."""
+    commands = _probe_commands(cfg)
+    if not commands:
+        return
+    try:
+        created = [path for path in iter_session_files(local_dir) if path not in before]
+        if created:
+            sweep_probe_transcripts(local_dir, commands, only=created)
+        # Older strays: from earlier runs, or from before cleanup existed.
+        sweep_probe_transcripts(local_dir, commands, min_age_s=cfg.cleanup_min_age_s)
+    except Exception:  # pragma: no cover - the janitor must never break a probe
+        log.debug("Probe cleanup failed", exc_info=True)
+
+
+def _run_cli_probe_inner(cfg: ParserConfig, timeout_s: float) -> LimitUsage:
     last_status = "CLI unavailable"
     for command in cfg.cli_commands:
         if not command:
@@ -836,6 +872,144 @@ def save_cached_limits(limits: LimitUsage, path: Path = CACHE_PATH) -> None:
         os.replace(tmp, path)
     except OSError as exc:
         log.debug("Could not cache limits: %s", exc)
+
+
+
+# --------------------------------------------------------------------------- #
+# Janitor: removing the transcripts our own CLI probe leaves behind
+# --------------------------------------------------------------------------- #
+
+#: ``<command-name>/usage</command-name>`` as written into a probe transcript.
+_COMMAND_NAME_RE = re.compile(r"<command-name>\s*(/[a-z-]+)\s*</command-name>", re.IGNORECASE)
+
+#: A probe transcript is a handful of short records. A real conversation is not.
+#: This is a belt-and-braces bound, not the primary test.
+PROBE_MAX_BYTES = 64 * 1024
+
+
+def is_probe_transcript(path: Path, commands: Iterable[str]) -> bool:
+    """True only for a content-free transcript the CLI probe left behind.
+
+    Deleting anything under ``~/.claude`` risks a user's real conversation, so
+    two conditions are required before anything else is considered:
+
+    * the file is small — a real conversation is not a couple of kilobytes;
+    * it records no assistant turn at all, so nothing was ever generated in it.
+
+    On top of that, one of two signatures must match:
+
+    * it contains a slash command this app actually invokes (``/usage``), which
+      is what a successful probe writes; or
+    * it contains no user message whatsoever. A rejected probe (``/status``
+      answers "isn't available in this environment") leaves only queue and
+      system rows. Nothing a person typed can be in such a file.
+
+    For a genuine session to match, it would have to contain no response and
+    either nothing the user typed or nothing but ``/usage`` — in which case
+    there is nothing in it to lose.
+    """
+    wanted = {c.lstrip("/").lower() for c in commands}
+    if not wanted:
+        return False
+    try:
+        if path.stat().st_size > PROBE_MAX_BYTES:
+            return False
+    except OSError:
+        return False
+
+    lines, error = _read_lines(path, 2_000)
+    if error or not lines:
+        return False
+
+    found_command = False
+    user_messages = 0
+    for line in lines:
+        line = line.strip()
+        if not line or line[0] != "{":
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        # Any assistant usage at all disqualifies the file immediately.
+        if _extract_usage(record):
+            return False
+        message = record.get("message")
+        if isinstance(message, dict):
+            if message.get("role") == "user":
+                user_messages += 1
+            content = message.get("content")
+            text = content if isinstance(content, str) else ""
+            if not text and isinstance(content, list):
+                text = " ".join(
+                    block.get("text", "")
+                    for block in content
+                    if isinstance(block, dict)
+                )
+            match = _COMMAND_NAME_RE.search(text)
+            if match and match.group(1).lstrip("/").lower() in wanted:
+                found_command = True
+
+    return found_command or user_messages == 0
+
+
+def sweep_probe_transcripts(
+    directory: Path,
+    commands: Iterable[str],
+    min_age_s: float = 30.0,
+    limit: int = 400,
+    dry_run: bool = False,
+    only: Optional[Iterable[Path]] = None,
+) -> List[Path]:
+    """Delete probe transcripts under ``directory``; return what was removed.
+
+    ``min_age_s`` leaves anything recent alone, so a session being written right
+    now is never a candidate. ``only`` restricts the sweep to an explicit set of
+    paths, which is how the files from the probe that just ran are collected
+    before they are old enough for the age rule.
+    """
+    removed: List[Path] = []
+    try:
+        if not directory.is_dir():
+            return removed
+    except OSError:
+        return removed
+
+    candidates = list(only) if only is not None else iter_session_files(directory)
+    cutoff = time.time() - min_age_s
+
+    for path in candidates[:limit]:
+        try:
+            if only is None and path.stat().st_mtime > cutoff:
+                continue
+        except OSError:
+            continue
+        if not is_probe_transcript(path, commands):
+            continue
+        if dry_run:
+            removed.append(path)
+            continue
+        try:
+            path.unlink()
+            removed.append(path)
+        except OSError as exc:
+            log.debug("Could not remove probe transcript %s: %s", path, exc)
+
+    if removed and not dry_run:
+        log.info("Janitor removed %d probe transcript(s)", len(removed))
+    return removed
+
+
+def _probe_commands(cfg: ParserConfig) -> List[str]:
+    """The slash commands the probe actually sends, e.g. ``['/usage']``."""
+    found: List[str] = []
+    for command in cfg.cli_commands:
+        for argument in command:
+            if isinstance(argument, str) and argument.startswith("/"):
+                found.append(argument)
+    return found
 
 
 # --------------------------------------------------------------------------- #

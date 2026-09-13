@@ -46,8 +46,10 @@ from parser import (
     LimitUsage,
     SessionUsage,
     UsageMonitor,
+    _probe_commands,
     build_tooltip,
     load_cached_limits,
+    sweep_probe_transcripts,
 )
 
 log = logging.getLogger(__name__)
@@ -802,7 +804,49 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     parser.add_argument("--no-tray", action="store_true", help="do not create a tray icon")
     parser.add_argument("--reset-position", action="store_true", help="ignore the saved position")
     parser.add_argument("--verbose", action="store_true", help="debug logging")
+    parser.add_argument(
+        "--clean-probe-logs",
+        action="store_true",
+        help="delete the transcripts left behind by CLI probes, then exit",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="with --clean-probe-logs, list what would be deleted without deleting it",
+    )
     return parser.parse_args(argv)
+
+
+def clean_probe_logs(config: Config, dry_run: bool) -> int:
+    """One-shot janitor run for the command line."""
+    directory = Path(config.parser.projects_dir).expanduser()
+    commands = _probe_commands(config.parser)
+    if not commands:
+        print("No slash-command probes are configured; nothing to clean.")
+        return 0
+
+    print(f"Scanning {directory}")
+    print(f"Matching probe transcripts for: {', '.join(commands)}")
+    removed = sweep_probe_transcripts(
+        directory, commands, min_age_s=config.parser.cleanup_min_age_s, dry_run=dry_run
+    )
+    if not removed:
+        print("Nothing to clean.")
+        return 0
+
+    total = 0
+    for path in removed:
+        try:
+            total += path.stat().st_size if dry_run else 0
+        except OSError:
+            pass
+        print(f"  {'would remove' if dry_run else 'removed'}  {path}")
+
+    if dry_run:
+        print(f"\n{len(removed)} file(s), {total / 1024:.1f} KB. Re-run without --dry-run.")
+    else:
+        print(f"\nRemoved {len(removed)} file(s).")
+    return 0
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -811,6 +855,8 @@ def main(argv: Optional[list] = None) -> int:
     set_windows_app_id()
 
     config = Config.load()
+    if args.clean_probe_logs:
+        return clean_probe_logs(config, args.dry_run)
     if args.no_tray:
         config.window.show_tray_icon = False
     if args.reset_position:

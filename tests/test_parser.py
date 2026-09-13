@@ -24,8 +24,12 @@ from parser import (  # noqa: E402
     parse_limit_output,
     parse_session_file,
     UsageMonitor,
+    _probe_commands,
+    is_probe_transcript,
     reset_discovery_cache,
     resolve_projects_dirs,
+    run_cli_probe,
+    sweep_probe_transcripts,
 )
 
 
@@ -610,3 +614,194 @@ def test_shutdown_joins_a_scan_that_is_still_running(qt_app, session_file: Path)
     assert monitor._session_thread is None
     assert monitor._session_worker is None
     del monitor  # must not abort the interpreter
+
+
+# --------------------------------------------------------------------------- #
+# Janitor
+# --------------------------------------------------------------------------- #
+
+#: A transcript exactly as ``claude -p /usage`` leaves it: a couple of queue
+#: rows, the slash command, and no assistant turn anywhere.
+def _probe_lines(command: str = "/usage") -> str:
+    return "\n".join(
+        [
+            json.dumps({"type": "queue-operation"}),
+            json.dumps({"type": "queue-operation"}),
+            json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": "<local-command-caveat>Caveat: …"},
+            }),
+            json.dumps({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": f"<command-name>{command}</command-name>\n<command-message>usage",
+                },
+            }),
+            json.dumps({"type": "system"}),
+            json.dumps({"type": "last-prompt"}),
+        ]
+    ) + "\n"
+
+
+def _write(path: Path, text: str, age_s: float = 300.0) -> Path:
+    import os
+    import time
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    stamp = time.time() - age_s
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+def test_recognises_a_probe_transcript(tmp_path: Path) -> None:
+    path = _write(tmp_path / "p.jsonl", _probe_lines())
+    assert is_probe_transcript(path, ["/usage", "/status"])
+
+
+def test_never_deletes_a_real_conversation(tmp_path: Path) -> None:
+    """The safety property. A transcript with any assistant turn is untouchable."""
+    real = _write(
+        tmp_path / "proj" / "real.jsonl",
+        _probe_lines() + _assistant("req_1", 100, 50) + "\n",
+    )
+    assert not is_probe_transcript(real, ["/usage"])
+    assert sweep_probe_transcripts(tmp_path, ["/usage"]) == []
+    assert real.exists()
+
+
+def test_ignores_transcripts_the_user_typed_into(tmp_path: Path) -> None:
+    """A user message with no slash command means a real, if short, session."""
+    chat = _write(
+        tmp_path / "proj" / "chat.jsonl",
+        json.dumps({"type": "user", "message": {"role": "user", "content": "hello there"}}) + "\n",
+    )
+    assert not is_probe_transcript(chat, ["/usage"])
+    assert sweep_probe_transcripts(tmp_path, ["/usage"]) == []
+    assert chat.exists()
+
+
+def test_recognises_a_rejected_probe_with_no_user_message(tmp_path: Path) -> None:
+    """`claude -p /status` is refused and leaves only queue/system rows behind."""
+    rejected = _write(
+        tmp_path / "proj" / "rejected.jsonl",
+        "\n".join(
+            json.dumps({"type": t})
+            for t in ("queue-operation", "queue-operation", "system", "system", "last-prompt")
+        ) + "\n",
+    )
+    assert is_probe_transcript(rejected, ["/usage", "/status"])
+
+
+def test_empty_rule_still_respects_assistant_turns(tmp_path: Path) -> None:
+    """No user message, but something was generated — keep it."""
+    odd = _write(
+        tmp_path / "proj" / "odd.jsonl",
+        json.dumps({"type": "queue-operation"}) + "\n" + _assistant("r", 10, 10) + "\n",
+    )
+    assert not is_probe_transcript(odd, ["/usage"])
+    assert odd.exists()
+
+
+def test_ignores_a_different_slash_command(tmp_path: Path) -> None:
+    other = _write(tmp_path / "proj" / "other.jsonl", _probe_lines("/compact"))
+    assert not is_probe_transcript(other, ["/usage", "/status"])
+    assert other.exists()
+
+
+def test_ignores_large_files_even_if_they_match(tmp_path: Path) -> None:
+    big = _write(
+        tmp_path / "proj" / "big.jsonl",
+        _probe_lines() + json.dumps({"type": "note", "pad": "x" * 70_000}) + "\n",
+    )
+    assert not is_probe_transcript(big, ["/usage"])
+    assert big.exists()
+
+
+def test_sweep_removes_probe_transcripts(tmp_path: Path) -> None:
+    a = _write(tmp_path / "proj" / "a.jsonl", _probe_lines())
+    b = _write(tmp_path / "proj" / "b.jsonl", _probe_lines("/status"))
+    real = _write(tmp_path / "proj" / "real.jsonl", _assistant("r", 5, 5) + "\n")
+
+    removed = sweep_probe_transcripts(tmp_path, ["/usage", "/status"])
+    assert set(removed) == {a, b}
+    assert not a.exists() and not b.exists()
+    assert real.exists(), "the real transcript must survive"
+
+
+def test_sweep_leaves_recent_files_alone(tmp_path: Path) -> None:
+    """A session being written right now must never be a candidate."""
+    fresh = _write(tmp_path / "proj" / "fresh.jsonl", _probe_lines(), age_s=0.0)
+    assert sweep_probe_transcripts(tmp_path, ["/usage"], min_age_s=30.0) == []
+    assert fresh.exists()
+    # ...unless it is explicitly named, which is how a just-finished probe is cleaned.
+    assert sweep_probe_transcripts(tmp_path, ["/usage"], only=[fresh]) == [fresh]
+    assert not fresh.exists()
+
+
+def test_sweep_dry_run_reports_without_deleting(tmp_path: Path) -> None:
+    a = _write(tmp_path / "proj" / "a.jsonl", _probe_lines())
+    assert sweep_probe_transcripts(tmp_path, ["/usage"], dry_run=True) == [a]
+    assert a.exists()
+
+
+def test_sweep_survives_a_missing_directory(tmp_path: Path) -> None:
+    assert sweep_probe_transcripts(tmp_path / "absent", ["/usage"]) == []
+
+
+def test_probe_commands_extracted_from_config() -> None:
+    assert _probe_commands(ParserConfig()) == ["/usage", "/status"]
+    assert _probe_commands(ParserConfig(cli_commands=[["claude", "--version"]])) == []
+
+
+def test_probe_run_cleans_up_after_itself(tmp_path: Path, monkeypatch) -> None:
+    """End to end: the file a probe creates is gone once the probe returns."""
+    projects = tmp_path / "projects" / "proj"
+    projects.mkdir(parents=True)
+    created = projects / "new-probe.jsonl"
+
+    def fake_run(*args, **kwargs):
+        created.write_text(_probe_lines(), encoding="utf-8")
+
+        class Completed:
+            returncode = 0
+            stdout = (
+                b"Current session: 17% used\n"
+                b"Current week (all models): 24% used\n"
+            )
+            stderr = b""
+
+        return Completed()
+
+    monkeypatch.setattr("parser.subprocess.run", fake_run)
+    cfg = ParserConfig(projects_dir=str(tmp_path / "projects"), auto_discover_wsl=False)
+
+    limits = run_cli_probe(cfg, timeout_s=5.0)
+    assert limits.ok and limits.weekly_percent == 24.0
+    assert not created.exists(), "the probe's own transcript must be removed"
+
+
+def test_cleanup_can_be_switched_off(tmp_path: Path, monkeypatch) -> None:
+    projects = tmp_path / "projects" / "proj"
+    projects.mkdir(parents=True)
+    created = projects / "kept.jsonl"
+
+    def fake_run(*args, **kwargs):
+        created.write_text(_probe_lines(), encoding="utf-8")
+
+        class Completed:
+            returncode = 0
+            stdout = b"Current week (all models): 24% used\n"
+            stderr = b""
+
+        return Completed()
+
+    monkeypatch.setattr("parser.subprocess.run", fake_run)
+    cfg = ParserConfig(
+        projects_dir=str(tmp_path / "projects"),
+        auto_discover_wsl=False,
+        cleanup_probe_logs=False,
+    )
+    run_cli_probe(cfg, timeout_s=5.0)
+    assert created.exists()
