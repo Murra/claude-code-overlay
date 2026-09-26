@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 
 APP_NAME = "Claude Code Overlay"
 APP_ID = "claude-code-overlay"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 #: Root of the Claude Code state directory.  Overridable for testing via the
 #: ``CLAUDE_CONFIG_DIR`` environment variable, which Claude Code itself honours.
