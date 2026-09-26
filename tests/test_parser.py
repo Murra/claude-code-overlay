@@ -12,6 +12,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from config import Config, ParserConfig, PollingConfig  # noqa: E402
 from parser import (  # noqa: E402
+    ACTIVITY_IDLE,
+    ACTIVITY_WORKING,
+    collect_agent_activity,
+    transcript_activity,
     LimitUsage,
     SessionUsage,
     _decode_console,
@@ -866,3 +870,83 @@ def test_cleanup_can_be_switched_off(tmp_path: Path, monkeypatch) -> None:
     )
     run_cli_probe(cfg, timeout_s=5.0)
     assert created.exists()
+
+
+# --------------------------------------------------------------------------- #
+# Agent activity
+# --------------------------------------------------------------------------- #
+
+
+def _turn(kind: str, **message) -> dict:
+    return {"type": kind, "message": {"role": kind, **message}}
+
+
+_PROMPT = _turn("user", content="fix the bug")
+_TOOL_CALL = _turn("assistant", stop_reason="tool_use", content=[{"type": "tool_use"}])
+_TOOL_RESULT = _turn("user", content=[{"type": "tool_result", "content": "ok"}])
+_ANSWER = _turn("assistant", stop_reason="end_turn", content=[{"type": "text"}])
+_TURN_DONE = {"type": "system", "subtype": "turn_duration", "durationMs": 1200}
+_BOOKKEEPING = {"type": "cost-state"}
+
+
+def _transcript(path: Path, *records: dict) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize(
+    "records, expected",
+    [
+        ((_PROMPT,), ACTIVITY_WORKING),
+        ((_PROMPT, _TOOL_CALL), ACTIVITY_WORKING),
+        ((_PROMPT, _TOOL_CALL, _TOOL_RESULT), ACTIVITY_WORKING),
+        ((_PROMPT, _ANSWER), ACTIVITY_IDLE),
+        ((_PROMPT, _ANSWER, _TURN_DONE, _BOOKKEEPING), ACTIVITY_IDLE),
+        (
+            (_PROMPT, _TOOL_CALL, _turn("user", content=[{"type": "text", "text": "[Request interrupted by user]"}])),
+            ACTIVITY_IDLE,
+        ),
+        # A slash command run locally never reaches the model.
+        ((_PROMPT, _ANSWER, _turn("user", content="<command-name>/clear</command-name>")), ACTIVITY_IDLE),
+        # A subagent's records in the parent transcript do not end the parent's turn.
+        ((_PROMPT, _TOOL_CALL, {**_ANSWER, "isSidechain": True}), ACTIVITY_WORKING),
+    ],
+)
+def test_transcript_activity(tmp_path: Path, records, expected) -> None:
+    path = _transcript(tmp_path / "s.jsonl", *records)
+    assert transcript_activity(path, idle_after_s=600) == expected
+
+
+def test_stale_transcript_is_idle_mid_turn(tmp_path: Path) -> None:
+    path = _transcript(tmp_path / "s.jsonl", _PROMPT, _TOOL_CALL)
+    later = path.stat().st_mtime + 601
+    assert transcript_activity(path, idle_after_s=600, now=later) == ACTIVITY_IDLE
+
+
+def test_half_written_last_line_is_ignored(tmp_path: Path) -> None:
+    path = _transcript(tmp_path / "s.jsonl", _PROMPT, _ANSWER)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write('{"type": "user", "mess')
+    assert transcript_activity(path, idle_after_s=600) == ACTIVITY_IDLE
+
+
+def test_missing_transcript_is_unknown(tmp_path: Path) -> None:
+    assert transcript_activity(tmp_path / "gone.jsonl", idle_after_s=600) is None
+
+
+def test_any_busy_agent_means_working(tmp_path: Path) -> None:
+    projects = tmp_path / "projects"
+    _transcript(projects / "a" / "one.jsonl", _PROMPT, _ANSWER, _TURN_DONE)
+    _transcript(projects / "b" / "two.jsonl", _PROMPT, _TOOL_CALL)
+    cfg = ParserConfig(projects_dir=str(projects), auto_discover_wsl=False)
+    assert collect_agent_activity(cfg, PollingConfig(), idle_after_s=600) == ACTIVITY_WORKING
+
+    _transcript(projects / "b" / "two.jsonl", _PROMPT, _ANSWER)
+    assert collect_agent_activity(cfg, PollingConfig(), idle_after_s=600) == ACTIVITY_IDLE
+
+
+def test_mascot_is_off_by_default() -> None:
+    assert Config().mascot.enabled is False
+    cfg = Config.from_dict({"mascot": {"enabled": True, "idle_gif": "duck.gif"}})
+    assert cfg.mascot.enabled and cfg.mascot.idle_gif == "duck.gif"

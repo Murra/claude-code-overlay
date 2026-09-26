@@ -117,7 +117,7 @@ Python 3.10–3.14. PyQt6 ships prebuilt wheels for all of them, so nothing is c
 | Left-drag | Move the overlay. The position is saved on release. |
 | Double-click | Force an immediate refresh. |
 | Scroll wheel | Fade in / out. |
-| Right-click | Refresh Now · Always on Top · Reset Position · Layout ▸ · Dock Over Taskbar · Count Cache Tokens · Hide · Exit |
+| Right-click | Refresh Now · Always on Top · Reset Position · Layout ▸ · Dock Over Taskbar · Count Cache Tokens · Show Agent Status · Hide · Exit |
 | Hover | Tooltip with both limits and their reset times, plus the token breakdown: input, output, cache read/write, message count, model, project and session ID. |
 | Tray click | Show / hide the overlay. |
 
@@ -142,6 +142,25 @@ bar the full width of the widget, which is a louder signal when you are near a l
 default: prompt-cache reads are billed at a fraction of normal input tokens and routinely
 outnumber them a hundred to one, so folding them into the total makes a long session look far
 more expensive than it was. The raw cache figures are listed either way.
+
+### Agent status
+
+Right-click → **Show Agent Status** adds a small square to the left of the labels. It shows
+one image while any Claude Code agent is mid-turn and another once every agent has finished and
+is waiting for you. It is off by default. Turning it on makes the window about 38 px wider; the
+bars keep their length.
+
+No artwork ships with the app. Point `mascot.idle_gif` and `mascot.working_gif` at GIFs of your
+own; until you do, or if a file cannot be read, it falls back to 😴 and 🤕. Square GIFs
+look best. Anything else is scaled to fit without stretching. The source should be 64x64 so it
+stays sharp on a 200% display (the slot is 32 px, so 32x32 is enough at 100%).
+
+The state comes from the transcripts the overlay already reads. A turn is over when the last
+assistant message ends with `end_turn` or the user interrupts it. A prompt, a tool call or a tool
+result means work is still in progress. Every session touched within `idle_after_s` counts, so
+several agents in parallel show "working" until the last one finishes. One blind spot: a
+permission prompt looks like work in progress, so the working image stays up until you answer
+it or `idle_after_s` passes.
 
 ## Using it with WSL
 
@@ -232,6 +251,13 @@ than fatal — so it is safe to edit by hand.
     "auto_discover_wsl": true,     // find Claude Code logs inside running WSL distros
     "extra_projects_dirs": [],     // additional transcript directories to merge in
     "discovery_ttl_s": 300
+  },
+  "mascot": {
+    "enabled": false,
+    "idle_gif": "",                // absolute, or relative to %USERPROFILE%\.claude-code-overlay
+    "working_gif": "",
+    "size": 32,                    // square slot, in logical px
+    "idle_after_s": 600            // an untouched transcript counts as idle after this
   }
 }
 ```

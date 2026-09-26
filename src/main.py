@@ -34,6 +34,7 @@ from PyQt6.QtGui import (
     QFont,
     QGuiApplication,
     QIcon,
+    QMovie,
     QPainter,
     QPainterPath,
     QPen,
@@ -41,8 +42,10 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
 
-from config import APP_NAME, APP_VERSION, Config, configure_logging
+from config import APP_HOME, APP_NAME, APP_VERSION, Config, configure_logging
 from parser import (
+    ACTIVITY_IDLE,
+    ACTIVITY_WORKING,
     LimitUsage,
     SessionUsage,
     UsageMonitor,
@@ -152,6 +155,9 @@ class OverlayWindow(QWidget):
         self._menu: Optional[QMenu] = None
         self.tray: Optional[QSystemTrayIcon] = None
         self._topmost_failed = False
+        #: Loaded lazily per state; ``None`` records a GIF that failed to load.
+        self._movies: dict = {}
+        self._mascot_state: Optional[str] = None
 
         self.session = SessionUsage(status="Scanning...")
         self.limits = load_cached_limits()
@@ -177,7 +183,7 @@ class OverlayWindow(QWidget):
         self.setWindowFlags(self._window_flags())
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-        self.setFixedSize(win.width, win.height)
+        self.setFixedSize(win.width + self._mascot_slot_width(), win.height)
         self.setWindowOpacity(max(0.2, min(1.0, win.opacity)))
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
@@ -223,6 +229,11 @@ class OverlayWindow(QWidget):
         self.action_cache.setChecked(self.config.parser.include_cache_tokens)
         self.action_cache.triggered.connect(self.toggle_cache_tokens)
 
+        self.action_mascot = QAction("Show Agent Status", self)
+        self.action_mascot.setCheckable(True)
+        self.action_mascot.setChecked(self.config.mascot.enabled)
+        self.action_mascot.triggered.connect(self.toggle_mascot)
+
         self.action_hide = QAction("Hide Overlay", self)
         self.action_hide.triggered.connect(self.toggle_visible)
 
@@ -246,6 +257,7 @@ class OverlayWindow(QWidget):
         layout_menu.addAction(self.action_layout_compact)
         menu.addAction(self.action_dock)
         menu.addAction(self.action_cache)
+        menu.addAction(self.action_mascot)
         if self.tray is not None:
             # Without a tray icon there would be no way to bring it back.
             menu.addAction(self.action_hide)
@@ -438,6 +450,7 @@ class OverlayWindow(QWidget):
 
     def _on_session(self, usage: SessionUsage) -> None:
         self.session = usage
+        self._sync_mascot()
         self._refresh_chrome()
 
     def _on_limits(self, limits: LimitUsage) -> None:
@@ -505,6 +518,26 @@ class OverlayWindow(QWidget):
         self.action_cache.setChecked(self.config.parser.include_cache_tokens)
         self.config.save()
         self._refresh_chrome()
+
+    def toggle_mascot(self) -> None:
+        """Show or hide the agent-status slot, growing the window to fit it.
+
+        The slot is added on the left and the bars keep their full width, so
+        the window gets wider rather than the bars getting shorter.
+        """
+        mascot = self.config.mascot
+        mascot.enabled = not mascot.enabled
+        self.action_mascot.setChecked(mascot.enabled)
+        self.setFixedSize(
+            self.config.window.width + self._mascot_slot_width(), self.config.window.height
+        )
+        self.config.save()
+        self._sync_mascot()
+        if mascot.enabled:
+            # Activity is only scanned while the slot is on; fetch it now
+            # rather than showing "idle" until the next poll.
+            self.monitor.refresh_session()
+        self.update()
 
     def toggle_visible(self) -> None:
         if self.isVisible():
@@ -645,9 +678,94 @@ class OverlayWindow(QWidget):
             painter.setPen(QPen(QColor(theme.border), float(win.border_width)))
             painter.drawPath(shell)
 
+        slot = self._mascot_slot_width()
+        if slot:
+            self._paint_mascot(painter)
+            painter.translate(slot, 0)
+
         painters = {"rows": self._paint_rows, "compact": self._paint_compact}
         painters.get(win.layout, self._paint_rows)(painter)
         painter.end()
+
+    # -- agent-status mascot ---------------------------------------------
+
+    #: Shown when a state has no usable GIF.
+    _MASCOT_EMOJI = {ACTIVITY_IDLE: "\U0001F634", ACTIVITY_WORKING: "\U0001F915"}
+
+    def _mascot_slot_width(self) -> int:
+        """Extra window width the mascot needs: its square plus a left inset."""
+        mascot = self.config.mascot
+        return max(16, int(mascot.size)) + 6 if mascot.enabled else 0
+
+    def _mascot_rect(self) -> QRectF:
+        size = float(max(16, int(self.config.mascot.size)))
+        return QRectF(6.0, (self.height() - size) / 2.0, size, size)
+
+    def _mascot_path(self, state: str) -> Optional[Path]:
+        mascot = self.config.mascot
+        raw = mascot.working_gif if state == ACTIVITY_WORKING else mascot.idle_gif
+        if not raw:
+            return None
+        path = Path(os.path.expandvars(os.path.expanduser(raw)))
+        return path if path.is_absolute() else APP_HOME / path
+
+    def _mascot_movie(self, state: str) -> Optional[QMovie]:
+        if state in self._movies:
+            return self._movies[state]
+        movie: Optional[QMovie] = None
+        path = self._mascot_path(state)
+        if path is not None:
+            candidate = QMovie(str(path))
+            if candidate.isValid():
+                candidate.setParent(self)
+                candidate.setCacheMode(QMovie.CacheMode.CacheAll)
+                candidate.frameChanged.connect(
+                    lambda _frame: self.update(self._mascot_rect().toAlignedRect())
+                )
+                movie = candidate
+            else:
+                log.warning("Cannot play %s GIF at %s; using an emoji", state, path)
+        self._movies[state] = movie
+        return movie
+
+    def _sync_mascot(self) -> None:
+        """Play the GIF for the current state and pause the other one."""
+        if not self.config.mascot.enabled:
+            state = None
+        elif self.session.activity == ACTIVITY_WORKING:
+            state = ACTIVITY_WORKING
+        else:
+            state = ACTIVITY_IDLE
+        if state == self._mascot_state:
+            return
+        for movie in self._movies.values():
+            if movie is not None:
+                movie.stop()
+        self._mascot_state = state
+        if state is not None:
+            movie = self._mascot_movie(state)
+            if movie is not None:
+                movie.start()
+
+    def _paint_mascot(self, painter: QPainter) -> None:
+        state = self._mascot_state or ACTIVITY_IDLE
+        target = self._mascot_rect()
+        movie = self._movies.get(state)
+        frame = movie.currentPixmap() if movie is not None else None
+        if frame is None or frame.isNull():
+            font = QFont("Segoe UI Emoji")
+            font.setPixelSize(int(target.height() * 0.8))
+            painter.setFont(font)
+            painter.drawText(target, int(Qt.AlignmentFlag.AlignCenter), self._MASCOT_EMOJI[state])
+            return
+        # Fit inside the square without stretching a non-square GIF.
+        scale = min(target.width() / frame.width(), target.height() / frame.height())
+        w, h = frame.width() * scale, frame.height() * scale
+        fitted = QRectF(target.center().x() - w / 2, target.center().y() - h / 2, w, h)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.drawPixmap(fitted, frame, QRectF(frame.rect()))
+        painter.restore()
 
     # -- shared helpers --------------------------------------------------
 
@@ -699,7 +817,8 @@ class OverlayWindow(QWidget):
         theme = self.config.theme
         pad_x, pad_y = 10.0, 5.0
         row_h = (self.height() - pad_y * 2) / 2.0
-        content = self.width() - pad_x * 2
+        # The configured width, not self.width(): the mascot slot sits outside it.
+        content = self.config.window.width - pad_x * 2
 
         label_w, value_w, time_w, gap = 44.0, 28.0, 40.0, 8.0
         bar_w = content - label_w - value_w - time_w - gap * 2
@@ -754,7 +873,7 @@ class OverlayWindow(QWidget):
         pad_x, pad_y = 10.0, 6.0
         gap = 4.0
         block_h = (self.height() - pad_y * 2 - gap) / 2.0
-        content = self.width() - pad_x * 2
+        content = self.config.window.width - pad_x * 2
         bar_h = 3.0
 
         font_label = QFont(theme.font_family, theme.font_size_label, QFont.Weight.Bold)

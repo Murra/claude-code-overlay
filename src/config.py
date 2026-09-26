@@ -204,11 +204,37 @@ class ParserConfig:
 
 
 @dataclass
+class MascotConfig:
+    """An optional animated face left of the bars showing whether an agent is busy.
+
+    Off by default. When on, the window grows by one square slot on the left;
+    the bars keep their full width. No artwork ships with the app: point the
+    two paths at GIFs of your own. Relative paths resolve against
+    ``~/.claude-code-overlay``. A missing or unreadable GIF falls back to an
+    emoji so the slot is never blank.
+    """
+
+    enabled: bool = False
+    #: Shown while every agent is waiting for you.
+    idle_gif: str = ""
+    #: Shown while any agent is mid-turn.
+    working_gif: str = ""
+    #: Edge of the square slot, in device-independent pixels. The GIF is
+    #: scaled to fit it, aspect ratio preserved.
+    size: int = 32
+    #: A transcript untouched for this long counts as idle whatever its last
+    #: record says: the session was closed, crashed, or is sitting on a
+    #: permission prompt nobody has answered.
+    idle_after_s: int = 600
+
+
+@dataclass
 class Config:
     window: WindowConfig = field(default_factory=WindowConfig)
     polling: PollingConfig = field(default_factory=PollingConfig)
     theme: ThemeConfig = field(default_factory=ThemeConfig)
     parser: ParserConfig = field(default_factory=ParserConfig)
+    mascot: MascotConfig = field(default_factory=MascotConfig)
 
     # ---------------------------------------------------------------- loading
 

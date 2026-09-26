@@ -89,6 +89,10 @@ class SessionUsage:
     status: str = "Scanning..."
     skipped_lines: int = 0
 
+    #: ``ACTIVITY_WORKING`` or ``ACTIVITY_IDLE`` across every recent
+    #: transcript; empty when the mascot is off and nobody asked.
+    activity: str = ""
+
     @property
     def billable_tokens(self) -> int:
         """Input + output, excluding cache traffic."""
@@ -682,6 +686,127 @@ def collect_session_usage(cfg: ParserConfig, polling: PollingConfig) -> SessionU
 
 
 # --------------------------------------------------------------------------- #
+# Agent activity
+# --------------------------------------------------------------------------- #
+
+ACTIVITY_WORKING = "working"
+ACTIVITY_IDLE = "idle"
+
+#: How much of a transcript's end to read when judging its state. The deciding
+#: record is almost always in the last few lines; tool results can be large,
+#: so leave generous room.
+_ACTIVITY_TAIL_BYTES = 256 * 1024
+
+#: Assistant stop reasons that hand the turn back to the user.
+_TURN_OVER_STOPS = ("end_turn", "stop_sequence", "max_tokens", "refusal")
+
+#: User records that Claude Code writes locally without prompting the model:
+#: slash-command echoes and their captured output.
+_LOCAL_COMMAND_PREFIXES = ("<command-name>", "<local-command-", "<command-message>")
+
+
+def _user_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return ""
+
+
+def _record_activity(record: Dict[str, Any]) -> Optional[str]:
+    """What one transcript record says about the turn, or ``None`` if nothing.
+
+    A finished turn ends ``assistant (end_turn)`` then ``system
+    (turn_duration)``. Anything that sends the model more work -- a prompt, a
+    tool result, an assistant turn stopping for a tool -- means it is busy.
+    Bookkeeping records (attachments, titles, cost snapshots) say nothing.
+    """
+    if record.get("isSidechain") or record.get("isMeta"):
+        return None
+    kind = record.get("type")
+    if kind == "system":
+        return ACTIVITY_IDLE if record.get("subtype") == "turn_duration" else None
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return None
+    if kind == "assistant":
+        if message.get("stop_reason") in _TURN_OVER_STOPS:
+            return ACTIVITY_IDLE
+        return ACTIVITY_WORKING
+    if kind == "user":
+        text = _user_text(message.get("content")).lstrip()
+        if text.startswith("[Request interrupted by user"):
+            return ACTIVITY_IDLE
+        if text.startswith(_LOCAL_COMMAND_PREFIXES):
+            return None
+        return ACTIVITY_WORKING
+    return None
+
+
+def transcript_activity(
+    path: Path, idle_after_s: float, now: Optional[float] = None
+) -> Optional[str]:
+    """Whether the agent writing ``path`` is mid-turn, or ``None`` if unknown.
+
+    A transcript untouched for ``idle_after_s`` is idle whatever it says, so a
+    session that was closed mid-tool-call does not read as busy forever.
+    """
+    now = time.time() if now is None else now
+    try:
+        stat = path.stat()
+        if now - stat.st_mtime > idle_after_s:
+            return ACTIVITY_IDLE
+        size = stat.st_size
+        with open(path, "rb") as handle:
+            if size > _ACTIVITY_TAIL_BYTES:
+                handle.seek(size - _ACTIVITY_TAIL_BYTES)
+                handle.readline()  # drop the partial first line
+            raw = handle.read()
+    except OSError:
+        return None
+
+    for line in reversed(raw.decode("utf-8", errors="replace").splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            record = json.loads(line)
+        except (ValueError, RecursionError):
+            continue  # typically the half-flushed final line
+        if isinstance(record, dict):
+            state = _record_activity(record)
+            if state is not None:
+                return state
+    return None
+
+
+def collect_agent_activity(
+    cfg: ParserConfig, polling: PollingConfig, idle_after_s: float
+) -> str:
+    """``ACTIVITY_WORKING`` if any recently touched transcript is mid-turn.
+
+    Only files modified within ``idle_after_s`` are opened, so the cost is a
+    directory walk plus a tail read of the handful of live sessions --
+    subagent transcripts included, since they live under the same root.
+    """
+    projects_dirs = resolve_projects_dirs(cfg, polling.cli_timeout_s)
+    now = time.time()
+    for path in iter_session_files(projects_dirs):
+        try:
+            if now - path.stat().st_mtime > idle_after_s:
+                break  # newest-first, so everything after is older
+        except OSError:
+            continue
+        if transcript_activity(path, idle_after_s, now) == ACTIVITY_WORKING:
+            return ACTIVITY_WORKING
+    return ACTIVITY_IDLE
+
+
+# --------------------------------------------------------------------------- #
 # CLI limit probing
 # --------------------------------------------------------------------------- #
 
@@ -1032,6 +1157,14 @@ class SessionScanWorker(QObject):
         except Exception:  # pragma: no cover - last-resort guard
             log.exception("Session scan crashed")
             usage = SessionUsage(status="Scan error")
+        mascot = self._config.mascot
+        if mascot.enabled:
+            try:
+                usage.activity = collect_agent_activity(
+                    self._config.parser, self._config.polling, mascot.idle_after_s
+                )
+            except Exception:  # pragma: no cover - last-resort guard
+                log.exception("Activity scan crashed")
         self.finished.emit(usage)
 
 
